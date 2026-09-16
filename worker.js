@@ -1,12 +1,20 @@
-// Cloudflare Worker for Solis Solar & Battery Telegram Bot (24/7 Serverless)
+// Cloudflare Worker: 24/7 Solis Bot for Telegram & LINE (Scheduled + Interactive)
 
 const CONFIG = {
+  // Solis Credentials
   SOLIS_KEY_ID: "1300386381678627414",
   SOLIS_SECRET: "ba8d33413e8d4238901ac0ea13465881",
   SOLIS_INVERTER_SN: "1031970264171302",
   BATTERY_CAPACITY_KWH: 16.0,
   ELECTRICITY_RATE_THB: 4.50,
-  TELEGRAM_BOT_TOKEN: "8945013570:AAFwdZegsgY-A2bxXEV7KNu3lapxQfrN2ok"
+
+  // Telegram Credentials
+  TELEGRAM_BOT_TOKEN: "8945013570:AAFwdZegsgY-A2bxXEV7KNu3lapxQfrN2ok",
+  TELEGRAM_CHAT_ID: "5683999810",
+
+  // LINE Credentials (ใส่ค่าจาก LINE Developers Console)
+  LINE_CHANNEL_ACCESS_TOKEN: "",
+  LINE_USER_ID: ""
 };
 
 // Pure JS MD5 (RFC 1321)
@@ -92,7 +100,6 @@ function md5Base64(string) {
   return btoa(String.fromCharCode.apply(null, bytes));
 }
 
-// HMAC-SHA1 using Web Crypto
 async function hmacSha1(key, message) {
   const enc = new TextEncoder();
   const cryptoKey = await crypto.subtle.importKey("raw", enc.encode(key), { name: "HMAC", hash: "SHA-1" }, false, ["sign"]);
@@ -100,7 +107,6 @@ async function hmacSha1(key, message) {
   return btoa(String.fromCharCode(...new Uint8Array(sig)));
 }
 
-// Call SolisCloud API
 async function callSolisApi(path, bodyObj) {
   const bodyStr = JSON.stringify(bodyObj);
   const contentMd5 = md5Base64(bodyStr);
@@ -196,8 +202,6 @@ function formatReport(station, inv) {
   const savingsToday = daySolarKwh * CONFIG.ELECTRICITY_RATE_THB;
   const savingsMonth = monthSolarKwh * CONFIG.ELECTRICITY_RATE_THB;
   const bar = getProgressBar(soc);
-
-  // EV Advice
   const evAdvice = getEvChargingAdvice(thTime.getHours(), soc, pvPower, loadPower);
 
   let batStatusHeader = "⏸ แบตเตอรี่สแตนด์บาย";
@@ -258,6 +262,10 @@ ${gridText}
 ✅ *สถานะระบบ: ปกติ (Inverter Online)*`;
 }
 
+function cleanForLine(text) {
+  return text.replace(/\*\*/g, "").replace(/\*/g, "").replace(/`/g, "");
+}
+
 async function sendTelegram(chatId, text) {
   const url = `https://api.telegram.org/bot${CONFIG.TELEGRAM_BOT_TOKEN}/sendMessage`;
   await fetch(url, {
@@ -267,38 +275,101 @@ async function sendTelegram(chatId, text) {
   });
 }
 
-export default {
-  async fetch(request, env, ctx) {
-    if (request.method !== "POST") return new Response("Solis Bot is Running 24/7!", { status: 200 });
-    try {
-      const update = await request.json();
-      if (update.message && update.message.text) {
-        const chatId = update.message.chat.id;
-        const text = update.message.text.trim().toLowerCase();
+async function sendLinePush(to, text) {
+  if (!CONFIG.LINE_CHANNEL_ACCESS_TOKEN || !to || to.includes("ใส่_")) return;
+  const url = "https://api.line.me/v2/bot/message/push";
+  await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${CONFIG.LINE_CHANNEL_ACCESS_TOKEN}`
+    },
+    body: JSON.stringify({
+      to: to,
+      messages: [{ type: "text", text: cleanForLine(text) }]
+    })
+  });
+}
 
+async function sendLineReply(replyToken, text) {
+  if (!CONFIG.LINE_CHANNEL_ACCESS_TOKEN) return;
+  const url = "https://api.line.me/v2/bot/message/reply";
+  await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${CONFIG.LINE_CHANNEL_ACCESS_TOKEN}`
+    },
+    body: JSON.stringify({
+      replyToken: replyToken,
+      messages: [{ type: "text", text: cleanForLine(text) }]
+    })
+  });
+}
+
+async function getSolarReport() {
+  const [stationRes, invRes] = await Promise.all([
+    callSolisApi("/v1/api/userStationList", { pageNo: 1, pageSize: 10 }),
+    callSolisApi("/v1/api/inverterDetail", { sn: CONFIG.SOLIS_INVERTER_SN })
+  ]);
+  const stationData = stationRes?.data?.page?.records?.[0] || stationRes?.data?.[0] || {};
+  const invData = invRes?.data || {};
+  return formatReport(stationData, invData);
+}
+
+export default {
+  // 1. ส่งอัตโนมัติ 8:00 - 21:00 น. (Cloudflare Cron Trigger) ทั้ง Telegram & LINE
+  async scheduled(controller, env, ctx) {
+    try {
+      const msg = await getSolarReport();
+      ctx.waitUntil(sendTelegram(CONFIG.TELEGRAM_CHAT_ID, msg));
+      if (CONFIG.LINE_USER_ID && !CONFIG.LINE_USER_ID.includes("ใส่_")) {
+        ctx.waitUntil(sendLinePush(CONFIG.LINE_USER_ID, msg));
+      }
+    } catch (e) {
+      console.error("Scheduled report error:", e);
+    }
+  },
+
+  // 2. ถาม-ตอบทันทีเมื่อแชท (รองรับทั้ง Telegram & LINE)
+  async fetch(request, env, ctx) {
+    if (request.method !== "POST") return new Response("Solis Bot (Telegram + LINE) is Running 24/7!", { status: 200 });
+    
+    try {
+      const body = await request.json();
+
+      // LINE Webhook
+      if (body.events && Array.isArray(body.events)) {
+        for (const event of body.events) {
+          if (event.type === "message" && event.message.type === "text") {
+            const replyToken = event.replyToken;
+            const text = event.message.text.trim().toLowerCase();
+            if (["status", "/status", "solar", "/solar", "ไฟ", "แบต", "สรุป"].includes(text)) {
+              const msg = await getSolarReport();
+              await sendLineReply(replyToken, msg);
+            } else {
+              await sendLineReply(replyToken, "💡 พิมพ์ 'status' หรือ 'ไฟ' เพื่อดูข้อมูลโซล่าเซลล์และแบตเตอรี่ได้ตลอดเวลาครับ");
+            }
+          }
+        }
+        return new Response("OK", { status: 200 });
+      }
+
+      // Telegram Webhook
+      if (body.message && body.message.text) {
+        const chatId = body.message.chat.id;
+        const text = body.message.text.trim().toLowerCase();
         if (["/status", "/solar", "/soral", "/battery", "/start", "status", "solar", "ไฟ"].includes(text)) {
           ctx.waitUntil(sendTelegram(chatId, "⏳ กำลังดึงข้อมูลสดจาก Solis Inverter สักครู่นะครับ..."));
-
-          const [stationRes, invRes] = await Promise.all([
-            callSolisApi("/v1/api/userStationList", { pageNo: 1, pageSize: 10 }),
-            callSolisApi("/v1/api/inverterDetail", { sn: CONFIG.SOLIS_INVERTER_SN })
-          ]);
-
-          const stationData = stationRes?.data?.page?.records?.[0] || stationRes?.data?.[0] || {};
-          const invData = invRes?.data || {};
-
-          if (invData && Object.keys(invData).length > 0) {
-            const msg = formatReport(stationData, invData);
-            await sendTelegram(chatId, msg);
-          } else {
-            await sendTelegram(chatId, `⚠️ SolisCloud แจ้งเตือน: ${invRes?.msg || "ไม่สามารถดึงข้อมูลได้"}`);
-          }
+          const msg = await getSolarReport();
+          await sendTelegram(chatId, msg);
         } else {
           await sendTelegram(chatId, "💡 พิมพ์ `/status` หรือ `/solar` เพื่อดูข้อมูลได้ตลอดเวลาครับ");
         }
+        return new Response("OK", { status: 200 });
       }
     } catch (e) {
-      console.error(e);
+      console.error("Webhook error:", e);
     }
     return new Response("OK", { status: 200 });
   }
