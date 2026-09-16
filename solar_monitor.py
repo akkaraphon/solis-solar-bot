@@ -22,24 +22,77 @@ def get_progress_bar(percent, total_blocks=10):
     empty = total_blocks - filled
     return "█" * filled + "░" * empty
 
+def translate_weather(cond):
+    if not cond:
+        return "ไม่ระบุ ⛅"
+    c = cond.lower()
+    if "sunny" in c or "clear" in c:
+        return "แดดจัด แจ่มใส ☀️"
+    if "light rain" in c:
+        return "ฝนตกเบาๆ 🌧️"
+    if "rain" in c or "shower" in c:
+        return "มีฝนตก 🌧️"
+    if "cloud" in c or "overcast" in c:
+        return "มีเมฆมาก ☁️"
+    if "thunder" in c:
+        return "ฝนฟ้าคะนอง ⛈️"
+    return f"{cond} ⛅"
+
+def get_ev_charging_advice(now_hour, soc, pv_power, load_power):
+    excess_solar = max(0.0, pv_power - load_power)
+    if 22 <= now_hour or now_hour < 6:
+        return "⚡ ช่วง Off-Peak (ค่าไฟถูกสุด) สามารถเสียบชาร์จรถ EV ได้คุ้มค่าที่สุด"
+    elif 6 <= now_hour < 10:
+        return "☀️ แดดช่วงเช้ากำลังชาร์จเข้าแบตเตอรี่บ้าน แนะนำรอให้แบตเตอรี่เต็มก่อน"
+    elif 10 <= now_hour < 16:
+        if soc >= 95.0:
+            if excess_solar >= 1.5:
+                return f"🟢 แบตบ้านเต็มแล้ว + มีแดดเหลือ `{excess_solar:.2f} kW` เสียบชาร์จรถ EV ฟรีได้เลย! 🚗⚡"
+            else:
+                return "🟢 แบตบ้านเต็มแล้ว สามารถเริ่มชาร์จรถได้ (ปรับกระแสชาร์จให้พอดีกับแดด)"
+        else:
+            return f"⏳ แบตบ้านอยู่ที่ `{soc:.0f}%` แนะนำรอให้แบตเต็มก่อน เพื่อไม่ให้รถแย่งไฟแบตเตอรี่บ้าน"
+    elif 16 <= now_hour < 22:
+        return "🌙 แดดหมดแล้ว แนะนำตั้งเวลาชาร์จรถหลัง 22:00 น. (ช่วง Off-Peak ค่าไฟถูก) จะไม่แย่งไฟแบตเตอรี่บ้าน"
+    return "💡 ตรวจสอบระดับแบตเตอรี่และแดดก่อนเสียบชาร์จ"
+
 async def fetch_solar_data():
     async with aiohttp.ClientSession() as session:
         api = SoliscloudAPI("https://www.soliscloud.com:13333", session)
         
-        # 1. Fetch Station List for daily and monthly totals
-        stations = await api.user_station_list(SOLIS_KEY_ID, SOLIS_SECRET, page_no=1, page_size=10)
-        station_data = stations[0] if stations else {}
+        # 1. Fetch Inverter Details with retry for 502/network hiccups
+        inverter = {}
+        for attempt in range(3):
+            try:
+                inverter = await api.inverter_detail(SOLIS_KEY_ID, SOLIS_SECRET, inverter_sn=SOLIS_INVERTER_SN)
+                if inverter:
+                    break
+            except Exception as e:
+                if attempt < 2:
+                    await asyncio.sleep(2)
+                else:
+                    raise e
         
-        # 2. Fetch Inverter Details for real-time power, battery SOC, etc.
-        inverter = await api.inverter_detail(SOLIS_KEY_ID, SOLIS_SECRET, inverter_sn=SOLIS_INVERTER_SN)
+        # 2. Try fetching Station List for weather (with safe fallback if slow)
+        station_data = {}
+        try:
+            stations = await asyncio.wait_for(
+                api.user_station_list(SOLIS_KEY_ID, SOLIS_SECRET, page_no=1, page_size=10),
+                timeout=4.0
+            )
+            if stations:
+                station_data = stations[0]
+        except Exception:
+            pass
         
         return station_data, inverter
 
 def format_telegram_message(station, inv):
-    # Solis timestamp or local time (UTC+7)
     tz_th = datetime.timezone(datetime.timedelta(hours=7))
     now_local = datetime.datetime.now(tz_th)
     time_str = now_local.strftime("%H:%M น.")
+    
+    weather_str = translate_weather(station.get("condTxtD"))
     
     # Battery Data
     soc = float(inv.get("batteryCapacitySoc", inv.get("batteryPercent", 100.0)))
@@ -48,32 +101,44 @@ def format_telegram_message(station, inv):
     current_kwh = (soc / 100.0) * BATTERY_CAPACITY_KWH
     cutoff_kwh = (cutoff_soc / 100.0) * BATTERY_CAPACITY_KWH
     
-    # Battery Power: Solis gives batteryPower or batteryPowerBms
     bat_power = float(inv.get("batteryPower", inv.get("batteryPowerBms", 0.0)))
-    bat_dir = inv.get("batteryDirection", 0)  # 1=charge, 2=discharge
+    bat_dir = inv.get("batteryDirection", 0)
     
     # Real-time Powers
     pv_power = float(inv.get("pac", 0.0))
     load_power = float(inv.get("totalLoadPower", 0.0))
     
-    # Energy Summaries
+    # String 1 & 2
+    pow1 = float(inv.get("pow1", inv.get("mpptPow1", 0.0)))
+    uPv1 = float(inv.get("uPv1", inv.get("mpptUpv1", 0.0)))
+    iPv1 = float(inv.get("iPv1", inv.get("mpptIpv1", 0.0)))
+    
+    pow2 = float(inv.get("pow2", inv.get("mpptPow2", 0.0)))
+    uPv2 = float(inv.get("uPv2", inv.get("mpptUpv2", 0.0)))
+    iPv2 = float(inv.get("iPv2", inv.get("mpptIpv2", 0.0)))
+    
+    inv_temp = float(inv.get("inverterTemperature", 0.0))
+    grid_volt = float(inv.get("uAc1", 0.0))
+    
+    # Energy Summaries (No CO2)
     day_solar_kwh = float(station.get("dayEnergy", inv.get("homeLoadTodayEnergy", 0.0)))
-    month_solar_kwh = float(station.get("monthEnergy", 0.0))
+    month_solar_kwh = float(station.get("monthEnergy", inv.get("homeLoadMonthEnergy", 0.0)))
     bat_charged_today = float(station.get("batteryTodayChargeEnergy", inv.get("batteryTodayChargeEnergy", 0.0)))
     bat_discharged_today = float(station.get("batteryTodayDischargeEnergy", inv.get("batteryTodayDischargeEnergy", 0.0)))
     
-    # Financial calculation
     savings_today = day_solar_kwh * ELECTRICITY_RATE_THB
     savings_month = month_solar_kwh * ELECTRICITY_RATE_THB
     
     bar = get_progress_bar(soc, 10)
     
-    # Determine Battery Status Text and Estimated Time
+    # EV Advice
+    ev_advice = get_ev_charging_advice(now_local.hour, soc, pv_power, load_power)
+    
+    # Battery Status Text
     if soc >= 99.5:
         bat_status_header = "🔋 แบตเตอรี่เต็ม 100% พร้อมใช้งาน"
         bat_sub_text = "• กำลังชาร์จ: `0.00 kW` ✅ (แบตเต็มแล้ว พร้อมชาร์จรถ EV! 🚗⚡)"
     elif bat_power > 0.05 or bat_dir == 1:
-        # Charging
         bat_status_header = "⚡ กำลังชาร์จไฟเข้าแบตเตอรี่"
         power_kw = abs(bat_power) if bat_power > 0 else 0.1
         kwh_needed = max(0.0, ((100.0 - soc) / 100.0) * BATTERY_CAPACITY_KWH)
@@ -85,7 +150,6 @@ def format_telegram_message(station, inv):
             f"• ⏳ **คาดว่าเต็ม 100% ในอีก:** `{minutes} นาที` *(~{target_time})*"
         )
     elif bat_power < -0.05 or bat_dir == 2:
-        # Discharging
         bat_status_header = "🌙 กำลังจ่ายไฟจากแบตเตอรี่"
         power_kw = abs(bat_power)
         usable_kwh = max(0.0, ((soc - cutoff_soc) / 100.0) * BATTERY_CAPACITY_KWH)
@@ -101,14 +165,13 @@ def format_telegram_message(station, inv):
         bat_status_header = "⏸ แบตเตอรี่สแตนด์บาย"
         bat_sub_text = "• สถานะ: `สแตนด์บาย` (ไม่ได้ชาร์จหรือคายประจุ)"
 
-    # Determine Grid flow
     grid_power = max(0.0, load_power - pv_power)
     grid_text = f"• 🔌 ไฟหลวง (Grid): `{grid_power:.2f} kW`" + (" *(Self-Powered 100%)*" if grid_power <= 0.05 else "")
     
     # Message Construction
     msg = (
         f"☀️ **SOLIS ENERGY MONITOR**\n"
-        f"⏱ *อัปเดต: {time_str} | สถานะ: {bat_status_header}*\n"
+        f"⏱ *อัปเดต: {time_str} | สภาพอากาศ: {weather_str}*\n"
         f"──────────────────\n"
         f"🔋 **สถานะแบตเตอรี่ (Battery State)**\n"
         f"• ระดับแบต: `[{bar}] {soc:.0f}%` *({current_kwh:.1f} / {BATTERY_CAPACITY_KWH:.1f} kWh)*\n"
@@ -117,9 +180,15 @@ def format_telegram_message(station, inv):
         f"• 🛡️ *ตั้งค่า Cut-off สำรองไฟไว้ที่: {cutoff_soc:.0f}% ({cutoff_kwh:.1f} kWh)*\n"
         f"\n"
         f"⚡ **การไหลของพลังงาน (Power Flow)**\n"
-        f"• ☀️ แผงโซล่าเซลล์: `{pv_power:.2f} kW`\n"
+        f"• ☀️ แผงโซล่าเซลล์รวม: `{pv_power:.2f} kW`\n"
+        f"  ├ 🧭 สตริง 1: `{pow1:.0f} W` *({uPv1:.1f}V / {iPv1:.1f}A)*\n"
+        f"  └ 🧭 สตริง 2: `{pow2:.0f} W` *({uPv2:.1f}V / {iPv2:.1f}A)*\n"
         f"• 🏠 โหลดใช้ในบ้าน: `{load_power:.2f} kW`\n"
         f"{grid_text}\n"
+        f"• 🌡️ ความร้อน Inverter: `{inv_temp:.1f}°C` | ไฟหลวง: `{grid_volt:.1f}V`\n"
+        f"\n"
+        f"🚗 **คำแนะนำชาร์จรถ EV:**\n"
+        f"• {ev_advice}\n"
         f"\n"
         f"💰 **สรุปยอดวันนี้ (Today Summary)**\n"
         f"• ไฟที่ผลิตได้วันนี้: `{day_solar_kwh:.2f} kWh`\n"

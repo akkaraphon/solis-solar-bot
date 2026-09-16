@@ -134,6 +134,28 @@ function translateWeather(cond) {
   return `${cond} ⛅`;
 }
 
+function getEvChargingAdvice(nowHour, soc, pvPower, loadPower) {
+  const excessSolar = Math.max(0, pvPower - loadPower);
+  if (nowHour >= 22 || nowHour < 6) {
+    return "⚡ ช่วง Off-Peak (ค่าไฟถูกสุด) สามารถเสียบชาร์จรถ EV ได้คุ้มค่าที่สุด";
+  } else if (nowHour >= 6 && nowHour < 10) {
+    return "☀️ แดดช่วงเช้ากำลังชาร์จเข้าแบตเตอรี่บ้าน แนะนำรอให้แบตเตอรี่เต็มก่อน";
+  } else if (nowHour >= 10 && nowHour < 16) {
+    if (soc >= 95) {
+      if (excessSolar >= 1.5) {
+        return `🟢 แบตบ้านเต็มแล้ว + มีแดดเหลือ \`${excessSolar.toFixed(2)} kW\` เสียบชาร์จรถ EV ฟรีได้เลย! 🚗⚡`;
+      } else {
+        return "🟢 แบตบ้านเต็มแล้ว สามารถเริ่มชาร์จรถได้ (ปรับกระแสชาร์จให้พอดีกับแดด)";
+      }
+    } else {
+      return `⏳ แบตบ้านอยู่ที่ \`${soc.toFixed(0)}%\` แนะนำรอให้แบตเต็มก่อน เพื่อไม่ให้รถแย่งไฟแบตเตอรี่บ้าน`;
+    }
+  } else if (nowHour >= 16 && nowHour < 22) {
+    return "🌙 แดดหมดแล้ว แนะนำตั้งเวลาชาร์จรถหลัง 22:00 น. (ช่วง Off-Peak ค่าไฟถูก) จะไม่แย่งไฟแบตเตอรี่บ้าน";
+  }
+  return "💡 ตรวจสอบระดับแบตเตอรี่และแดดก่อนเสียบชาร์จ";
+}
+
 function formatReport(station, inv) {
   const now = new Date();
   const thTime = new Date(now.getTime() + (7 * 60 + now.getTimezoneOffset()) * 60000);
@@ -152,7 +174,7 @@ function formatReport(station, inv) {
   const pvPower = parseFloat(inv.pac || 0);
   const loadPower = parseFloat(inv.totalLoadPower || 0);
 
-  // String 1 & String 2 (ทิศทางแผง / MPPT)
+  // ข้อมูลแยกสตริง 1 และ 2
   const pow1 = parseFloat(inv.pow1 || inv.mpptPow1 || 0);
   const uPv1 = parseFloat(inv.uPv1 || inv.mpptUpv1 || 0);
   const iPv1 = parseFloat(inv.iPv1 || inv.mpptIpv1 || 0);
@@ -161,11 +183,11 @@ function formatReport(station, inv) {
   const uPv2 = parseFloat(inv.uPv2 || inv.mpptUpv2 || 0);
   const iPv2 = parseFloat(inv.iPv2 || inv.mpptIpv2 || 0);
 
-  // Inverter Temp & Grid Voltage
+  // อุณหภูมิและแรงดันไฟ
   const invTemp = parseFloat(inv.inverterTemperature || 0);
   const gridVolt = parseFloat(inv.uAc1 || 0);
 
-  // Energy & Financial (NO CO2)
+  // ยอดพลังงานและการเงิน (ไม่มี CO2)
   const daySolarKwh = parseFloat(station.dayEnergy || inv.homeLoadTodayEnergy || 0);
   const monthSolarKwh = parseFloat(station.monthEnergy || inv.homeLoadMonthEnergy || 0);
   const batChargedToday = parseFloat(station.batteryTodayChargeEnergy || inv.batteryTodayChargeEnergy || 0);
@@ -174,6 +196,9 @@ function formatReport(station, inv) {
   const savingsToday = daySolarKwh * CONFIG.ELECTRICITY_RATE_THB;
   const savingsMonth = monthSolarKwh * CONFIG.ELECTRICITY_RATE_THB;
   const bar = getProgressBar(soc);
+
+  // EV Advice
+  const evAdvice = getEvChargingAdvice(thTime.getHours(), soc, pvPower, loadPower);
 
   let batStatusHeader = "⏸ แบตเตอรี่สแตนด์บาย";
   let batSubText = "• สถานะ: `สแตนด์บาย` (ไม่ได้ชาร์จหรือคายประจุ)";
@@ -220,6 +245,9 @@ ${batSubText}
 • 🏠 โหลดใช้ในบ้าน: \`${loadPower.toFixed(2)} kW\`
 ${gridText}
 • 🌡️ ความร้อน Inverter: \`${invTemp.toFixed(1)}°C\` | ไฟหลวง: \`${gridVolt.toFixed(1)}V\`
+
+🚗 **คำแนะนำชาร์จรถ EV:**
+• ${evAdvice}
 
 💰 **สรุปยอดวันนี้ (Today Summary)**
 • ไฟที่ผลิตได้วันนี้: \`${daySolarKwh.toFixed(2)} kWh\`
