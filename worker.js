@@ -12,9 +12,9 @@ const CONFIG = {
   TELEGRAM_BOT_TOKEN: "8945013570:AAFwdZegsgY-A2bxXEV7KNu3lapxQfrN2ok",
   TELEGRAM_CHAT_ID: "5683999810",
 
-  // LINE Credentials (ใส่ค่าจาก LINE Developers Console)
-  LINE_CHANNEL_ACCESS_TOKEN: "",
-  LINE_USER_ID: ""
+  // LINE Credentials
+  LINE_CHANNEL_ACCESS_TOKEN: "vJ7VzZULPP/r3DWw7ZR5E9gfewqb3g1GCFlHpfSE0ocy8A/CpzLS70riCueUj4+iJAvnds8PMEQxWaOhXchz0bknzScCrBXr84jPic1Q+GSH+ZQAFLgrs232bL+15eVGg5CjKu2t7zCTTFrEhZBZLQdB04t89/1O/w1cDnyilFU=",
+  LINE_USER_ID: "Ue4b74fb90e1966656b11f0882b765348"
 };
 
 // Pure JS MD5 (RFC 1321)
@@ -344,7 +344,8 @@ export default {
           if (event.type === "message" && event.message.type === "text") {
             const replyToken = event.replyToken;
             const text = event.message.text.trim().toLowerCase();
-            if (["status", "/status", "solar", "/solar", "ไฟ", "แบต", "สรุป"].includes(text)) {
+            const isQuery = ["status", "solar", "ไฟ", "แบต", "สรุป", "ค่าไฟ", "พลังงาน", "ev", "ดูไฟ", "เช็คไฟ", "สถานะ", "โซล่า"].some(k => text.includes(k));
+            if (isQuery) {
               const msg = await getSolarReport();
               await sendLineReply(replyToken, msg);
             } else {
@@ -359,7 +360,8 @@ export default {
       if (body.message && body.message.text) {
         const chatId = body.message.chat.id;
         const text = body.message.text.trim().toLowerCase();
-        if (["/status", "/solar", "/soral", "/battery", "/start", "status", "solar", "ไฟ"].includes(text)) {
+        const isQuery = ["/status", "/solar", "/soral", "/battery", "/start", "status", "solar", "ไฟ", "แบต", "สรุป", "ค่าไฟ", "พลังงาน", "ev", "ดูไฟ", "เช็คไฟ", "สถานะ", "โซล่า"].some(k => text.includes(k));
+        if (isQuery) {
           ctx.waitUntil(sendTelegram(chatId, "⏳ กำลังดึงข้อมูลสดจาก Solis Inverter สักครู่นะครับ..."));
           const msg = await getSolarReport();
           await sendTelegram(chatId, msg);
