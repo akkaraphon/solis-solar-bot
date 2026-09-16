@@ -108,7 +108,7 @@ async function hmacSha1(key, message) {
   return btoa(String.fromCharCode(...new Uint8Array(sig)));
 }
 
-async function callSolisApi(path, bodyObj) {
+async function callSolisApi(path, bodyObj, timeoutMs = 12000) {
   const bodyStr = JSON.stringify(bodyObj);
   const contentMd5 = md5Base64(bodyStr);
   const contentType = "application/json";
@@ -117,12 +117,23 @@ async function callSolisApi(path, bodyObj) {
   const sign = await hmacSha1(CONFIG.SOLIS_SECRET, stringToSign);
   const auth = `API ${CONFIG.SOLIS_KEY_ID}:${sign}`;
 
-  const res = await fetch(`https://www.soliscloud.com:13333${path}`, {
-    method: "POST",
-    headers: { "Content-Type": contentType, "Content-MD5": contentMd5, "Date": dateStr, "Authorization": auth },
-    body: bodyStr
-  });
-  return await res.json();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const res = await fetch(`https://www.soliscloud.com:13333${path}`, {
+      method: "POST",
+      headers: { "Content-Type": contentType, "Content-MD5": contentMd5, "Date": dateStr, "Authorization": auth },
+      body: bodyStr,
+      signal: controller.signal
+    });
+    return await res.json();
+  } catch (err) {
+    console.error(`Solis API error (${path}):`, err);
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function getProgressBar(percent, totalBlocks = 10) {
@@ -293,19 +304,66 @@ async function sendLinePush(to, text) {
 }
 
 async function sendLineReply(replyToken, text) {
-  if (!CONFIG.LINE_CHANNEL_ACCESS_TOKEN) return;
-  const url = "https://api.line.me/v2/bot/message/reply";
-  await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${CONFIG.LINE_CHANNEL_ACCESS_TOKEN}`
-    },
-    body: JSON.stringify({
-      replyToken: replyToken,
-      messages: [{ type: "text", text: cleanForLine(text) }]
-    })
-  });
+  if (!CONFIG.LINE_CHANNEL_ACCESS_TOKEN || !replyToken) return false;
+  try {
+    const url = "https://api.line.me/v2/bot/message/reply";
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${CONFIG.LINE_CHANNEL_ACCESS_TOKEN}`
+      },
+      body: JSON.stringify({
+        replyToken: replyToken,
+        messages: [{ type: "text", text: cleanForLine(text) }]
+      })
+    });
+    return res.ok;
+  } catch (e) {
+    console.error("sendLineReply error:", e);
+    return false;
+  }
+}
+
+async function handleLineEvent(event) {
+  try {
+    const replyToken = event.replyToken;
+
+    // เมื่อดึงบอทเข้ากลุ่ม
+    if (event.type === "join") {
+      const gid = event.source?.groupId || event.source?.roomId || "";
+      await sendLineReply(replyToken, `👋 สวัสดีครับ! ผม Solis Solar Bot ☀️\n\n🆔 Group ID:\n${gid}\n\n💡 พิมพ์ "ไฟ" หรือ "status" ในกลุ่มเพื่อดูข้อมูลโซล่าเซลล์ได้ตลอดเวลาครับ`);
+      return;
+    }
+
+    if (event.type === "message" && event.message?.type === "text") {
+      const text = (event.message.text || "").trim().toLowerCase();
+      const isGroup = event.source?.type === "group" || event.source?.type === "room";
+      const targetId = event.source?.groupId || event.source?.roomId || event.source?.userId;
+
+      // ขอดู Group ID ในกลุ่ม
+      if (["groupid", "group id", "id กลุ่ม", "ไอดีกลุ่ม", "เช็คไอดี"].includes(text)) {
+        const gid = isGroup ? targetId : "ไม่ใช่ข้อความจากกลุ่มครับ";
+        await sendLineReply(replyToken, `🆔 Group ID ของกลุ่มนี้คือ:\n${gid}`);
+        return;
+      }
+
+      const isQuery = ["status", "solar", "ไฟ", "แบต", "สรุป", "ค่าไฟ", "พลังงาน", "ev", "ดูไฟ", "เช็คไฟ", "สถานะ", "โซล่า"].some(k => text.includes(k));
+      if (isQuery) {
+        const msg = await getSolarReport();
+        const replied = await sendLineReply(replyToken, msg);
+        // หาก Reply Token หมดอายุหรือไม่สำเร็จ ให้ fallback ส่ง push ไปที่ห้องนั้น
+        if (!replied && targetId) {
+          await sendLinePush(targetId, msg);
+        }
+      } else if (!isGroup) {
+        // ตอบแนะนำเฉพาะในแชทส่วนตัว ไม่ตอบรบกวนเวลาคนคุยกันในกลุ่ม
+        await sendLineReply(replyToken, "💡 พิมพ์ 'status' หรือ 'ไฟ' เพื่อดูข้อมูลโซล่าเซลล์และแบตเตอรี่ได้ตลอดเวลาครับ");
+      }
+    }
+  } catch (err) {
+    console.error("handleLineEvent error:", err);
+  }
 }
 
 async function getSolarReport() {
@@ -349,38 +407,10 @@ export default {
     try {
       const body = await request.json();
 
-      // LINE Webhook
+      // LINE Webhook (ตอบกลับ 200 OK ทันที แล้วประมวลผลผ่าน waitUntil เพื่อป้องกัน LINE Webhook Timeout)
       if (body.events && Array.isArray(body.events)) {
         for (const event of body.events) {
-          const replyToken = event.replyToken;
-
-          // เมื่อดึงบอทเข้ากลุ่ม
-          if (event.type === "join") {
-            const gid = event.source.groupId || event.source.roomId || "";
-            await sendLineReply(replyToken, `👋 สวัสดีครับ! ผม Solis Solar Bot ☀️\n\n🆔 Group ID:\n${gid}\n\n💡 พิมพ์ "ไฟ" หรือ "status" ในกลุ่มเพื่อดูข้อมูลโซล่าเซลล์ได้ตลอดเวลาครับ`);
-            continue;
-          }
-
-          if (event.type === "message" && event.message.type === "text") {
-            const text = event.message.text.trim().toLowerCase();
-            const isGroup = event.source.type === "group" || event.source.type === "room";
-
-            // ขอดู Group ID ในกลุ่ม
-            if (["groupid", "group id", "id กลุ่ม", "ไอดีกลุ่ม", "เช็คไอดี"].includes(text)) {
-              const gid = event.source.groupId || event.source.roomId || "ไม่ใช่ข้อความจากกลุ่มครับ";
-              await sendLineReply(replyToken, `🆔 Group ID ของกลุ่มนี้คือ:\n${gid}`);
-              continue;
-            }
-
-            const isQuery = ["status", "solar", "ไฟ", "แบต", "สรุป", "ค่าไฟ", "พลังงาน", "ev", "ดูไฟ", "เช็คไฟ", "สถานะ", "โซล่า"].some(k => text.includes(k));
-            if (isQuery) {
-              const msg = await getSolarReport();
-              await sendLineReply(replyToken, msg);
-            } else if (!isGroup) {
-              // ตอบแนะนำเฉพาะในแชทส่วนตัว ไม่ตอบรบกวนเวลาคนคุยกันในกลุ่ม
-              await sendLineReply(replyToken, "💡 พิมพ์ 'status' หรือ 'ไฟ' เพื่อดูข้อมูลโซล่าเซลล์และแบตเตอรี่ได้ตลอดเวลาครับ");
-            }
-          }
+          ctx.waitUntil(handleLineEvent(event));
         }
         return new Response("OK", { status: 200 });
       }
@@ -391,11 +421,13 @@ export default {
         const text = body.message.text.trim().toLowerCase();
         const isQuery = ["/status", "/solar", "/soral", "/battery", "/start", "status", "solar", "ไฟ", "แบต", "สรุป", "ค่าไฟ", "พลังงาน", "ev", "ดูไฟ", "เช็คไฟ", "สถานะ", "โซล่า"].some(k => text.includes(k));
         if (isQuery) {
-          ctx.waitUntil(sendTelegram(chatId, "⏳ กำลังดึงข้อมูลสดจาก Solis Inverter สักครู่นะครับ..."));
-          const msg = await getSolarReport();
-          await sendTelegram(chatId, msg);
+          ctx.waitUntil((async () => {
+            await sendTelegram(chatId, "⏳ กำลังดึงข้อมูลสดจาก Solis Inverter สักครู่นะครับ...");
+            const msg = await getSolarReport();
+            await sendTelegram(chatId, msg);
+          })());
         } else {
-          await sendTelegram(chatId, "💡 พิมพ์ `/status` หรือ `/solar` เพื่อดูข้อมูลได้ตลอดเวลาครับ");
+          ctx.waitUntil(sendTelegram(chatId, "💡 พิมพ์ `/status` หรือ `/solar` เพื่อดูข้อมูลได้ตลอดเวลาครับ"));
         }
         return new Response("OK", { status: 200 });
       }
