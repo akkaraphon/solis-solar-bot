@@ -108,7 +108,7 @@ async function hmacSha1(key, message) {
   return btoa(String.fromCharCode(...new Uint8Array(sig)));
 }
 
-async function callSolisApi(path, bodyObj, timeoutMs = 12000) {
+async function callSolisApi(path, bodyObj, timeoutMs = 28000) {
   const bodyStr = JSON.stringify(bodyObj);
   const contentMd5 = md5Base64(bodyStr);
   const contentType = "application/json";
