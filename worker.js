@@ -15,7 +15,7 @@ const CONFIG = {
   // LINE Credentials
   LINE_CHANNEL_ACCESS_TOKEN: "vJ7VzZULPP/r3DWw7ZR5E9gfewqb3g1GCFlHpfSE0ocy8A/CpzLS70riCueUj4+iJAvnds8PMEQxWaOhXchz0bknzScCrBXr84jPic1Q+GSH+ZQAFLgrs232bL+15eVGg5CjKu2t7zCTTFrEhZBZLQdB04t89/1O/w1cDnyilFU=",
   LINE_USER_ID: "Ue4b74fb90e1966656b11f0882b765348",
-  LINE_GROUP_ID: "" // ใส่ Group ID ถ้าต้องการให้ส่งรายชั่วโมงเข้ากลุ่มแทน (บอทจะบอก ID เมื่อเข้ากลุ่ม)
+  LINE_GROUP_ID: "C085157e6ad4d196d26bf17ab3606d370"
 };
 
 // Pure JS MD5 (RFC 1321)
@@ -319,13 +319,22 @@ async function getSolarReport() {
 }
 
 export default {
-  // 1. ส่งอัตโนมัติ 8:00 - 21:00 น. (Cloudflare Cron Trigger) ทั้ง Telegram & LINE
+  // 1. ส่งอัตโนมัติ: Telegram ทุกชั่วโมง (08:00 - 21:00 น.), LINE ส่ง 3 เวลา (08:00, 13:00, 18:00 น.) เพื่อคุมโควตาฟรี
   async scheduled(controller, env, ctx) {
     try {
+      const now = new Date();
+      const thTime = new Date(now.getTime() + (7 * 60 + now.getTimezoneOffset()) * 60000);
+      const thHour = thTime.getHours();
+
       const msg = await getSolarReport();
+
+      // Telegram: ส่งทุกชั่วโมง 08:00 - 21:00 น. (ฟรีไม่จำกัด)
       ctx.waitUntil(sendTelegram(CONFIG.TELEGRAM_CHAT_ID, msg));
+
+      // LINE: ส่งเฉพาะ 08:00, 13:00, 18:00 น. เพื่อคุมโควตาฟรี 500 ข้อความ/เดือน (3 ครั้ง x 5 คน x 30 วัน = 450 ข้อความ)
+      const isLineHour = [8, 13, 18].includes(thHour);
       const lineTarget = CONFIG.LINE_GROUP_ID || CONFIG.LINE_USER_ID;
-      if (lineTarget && !lineTarget.includes("ใส่_")) {
+      if (isLineHour && lineTarget && !lineTarget.includes("ใส่_")) {
         ctx.waitUntil(sendLinePush(lineTarget, msg));
       }
     } catch (e) {
