@@ -14,7 +14,8 @@ const CONFIG = {
 
   // LINE Credentials
   LINE_CHANNEL_ACCESS_TOKEN: "vJ7VzZULPP/r3DWw7ZR5E9gfewqb3g1GCFlHpfSE0ocy8A/CpzLS70riCueUj4+iJAvnds8PMEQxWaOhXchz0bknzScCrBXr84jPic1Q+GSH+ZQAFLgrs232bL+15eVGg5CjKu2t7zCTTFrEhZBZLQdB04t89/1O/w1cDnyilFU=",
-  LINE_USER_ID: "Ue4b74fb90e1966656b11f0882b765348"
+  LINE_USER_ID: "Ue4b74fb90e1966656b11f0882b765348",
+  LINE_GROUP_ID: "" // ใส่ Group ID ถ้าต้องการให้ส่งรายชั่วโมงเข้ากลุ่มแทน (บอทจะบอก ID เมื่อเข้ากลุ่ม)
 };
 
 // Pure JS MD5 (RFC 1321)
@@ -323,8 +324,9 @@ export default {
     try {
       const msg = await getSolarReport();
       ctx.waitUntil(sendTelegram(CONFIG.TELEGRAM_CHAT_ID, msg));
-      if (CONFIG.LINE_USER_ID && !CONFIG.LINE_USER_ID.includes("ใส่_")) {
-        ctx.waitUntil(sendLinePush(CONFIG.LINE_USER_ID, msg));
+      const lineTarget = CONFIG.LINE_GROUP_ID || CONFIG.LINE_USER_ID;
+      if (lineTarget && !lineTarget.includes("ใส่_")) {
+        ctx.waitUntil(sendLinePush(lineTarget, msg));
       }
     } catch (e) {
       console.error("Scheduled report error:", e);
@@ -341,14 +343,32 @@ export default {
       // LINE Webhook
       if (body.events && Array.isArray(body.events)) {
         for (const event of body.events) {
+          const replyToken = event.replyToken;
+
+          // เมื่อดึงบอทเข้ากลุ่ม
+          if (event.type === "join") {
+            const gid = event.source.groupId || event.source.roomId || "";
+            await sendLineReply(replyToken, `👋 สวัสดีครับ! ผม Solis Solar Bot ☀️\n\n🆔 Group ID:\n${gid}\n\n💡 พิมพ์ "ไฟ" หรือ "status" ในกลุ่มเพื่อดูข้อมูลโซล่าเซลล์ได้ตลอดเวลาครับ`);
+            continue;
+          }
+
           if (event.type === "message" && event.message.type === "text") {
-            const replyToken = event.replyToken;
             const text = event.message.text.trim().toLowerCase();
+            const isGroup = event.source.type === "group" || event.source.type === "room";
+
+            // ขอดู Group ID ในกลุ่ม
+            if (["groupid", "group id", "id กลุ่ม", "ไอดีกลุ่ม", "เช็คไอดี"].includes(text)) {
+              const gid = event.source.groupId || event.source.roomId || "ไม่ใช่ข้อความจากกลุ่มครับ";
+              await sendLineReply(replyToken, `🆔 Group ID ของกลุ่มนี้คือ:\n${gid}`);
+              continue;
+            }
+
             const isQuery = ["status", "solar", "ไฟ", "แบต", "สรุป", "ค่าไฟ", "พลังงาน", "ev", "ดูไฟ", "เช็คไฟ", "สถานะ", "โซล่า"].some(k => text.includes(k));
             if (isQuery) {
               const msg = await getSolarReport();
               await sendLineReply(replyToken, msg);
-            } else {
+            } else if (!isGroup) {
+              // ตอบแนะนำเฉพาะในแชทส่วนตัว ไม่ตอบรบกวนเวลาคนคุยกันในกลุ่ม
               await sendLineReply(replyToken, "💡 พิมพ์ 'status' หรือ 'ไฟ' เพื่อดูข้อมูลโซล่าเซลล์และแบตเตอรี่ได้ตลอดเวลาครับ");
             }
           }
