@@ -1,0 +1,42 @@
+name: Solis Solar & Battery Telegram Report
+
+on:
+  schedule:
+    # Runs at:
+    # 00:00 UTC = 07:00 TH (เช้า เริ่มต้นวัน)
+    # 04:30 UTC = 11:30 TH (เที่ยง เช็คแดดพีค)
+    # 07:30 UTC = 14:30 TH (บ่าย แบตเต็ม / แดดช่วงบ่าย)
+    # 11:00 UTC = 18:00 TH (เย็น แดดหมด สรุปยอดประจำวัน)
+    # 14:00 UTC = 21:00 TH (ก่อนนอน เช็คสถานะแบตเตอรี่)
+    - cron: '0 0,11,14 * * *'
+    - cron: '30 4,7 * * *'
+  workflow_dispatch: # กดสั่งรันเองจากเว็บ หรือแอป GitHub บนมือถือได้ตลอดเวลา
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Solar Monitor
+        env:
+          SOLIS_KEY_ID: ${{ secrets.SOLIS_KEY_ID }}
+          SOLIS_SECRET: ${{ secrets.SOLIS_SECRET }}
+          SOLIS_INVERTER_SN: ${{ secrets.SOLIS_INVERTER_SN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          BATTERY_CAPACITY_KWH: ${{ secrets.BATTERY_CAPACITY_KWH }}
+          ELECTRICITY_RATE_THB: ${{ secrets.ELECTRICITY_RATE_THB }}
+        run: |
+          python solar_monitor.py
