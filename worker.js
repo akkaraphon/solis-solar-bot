@@ -9,7 +9,7 @@ const CONFIG = {
   TELEGRAM_BOT_TOKEN: "8945013570:AAFwdZegsgY-A2bxXEV7KNu3lapxQfrN2ok"
 };
 
-// Pure JS MD5 (RFC 1321) to ensure 100% compatibility in Cloudflare Workers
+// Pure JS MD5 (RFC 1321)
 function md5Base64(string) {
   function r(v, s) { return (v << s) | (v >>> (32 - s)); }
   function add(x, y) {
@@ -123,10 +123,23 @@ function getProgressBar(percent, totalBlocks = 10) {
   return "█".repeat(filled) + "░".repeat(totalBlocks - filled);
 }
 
-function formatReport(inv) {
+function translateWeather(cond) {
+  if (!cond) return "ไม่ระบุ ⛅";
+  const c = cond.toLowerCase();
+  if (c.includes("sunny") || c.includes("clear")) return "แดดจัด แจ่มใส ☀️";
+  if (c.includes("light rain")) return "ฝนตกเบาๆ 🌧️";
+  if (c.includes("rain") || c.includes("shower")) return "มีฝนตก 🌧️";
+  if (c.includes("cloud") || c.includes("overcast")) return "มีเมฆมาก ☁️";
+  if (c.includes("thunder")) return "ฝนฟ้าคะนอง ⛈️";
+  return `${cond} ⛅`;
+}
+
+function formatReport(station, inv) {
   const now = new Date();
   const thTime = new Date(now.getTime() + (7 * 60 + now.getTimezoneOffset()) * 60000);
   const timeStr = `${String(thTime.getHours()).padStart(2, "0")}:${String(thTime.getMinutes()).padStart(2, "0")} น.`;
+
+  const weatherStr = translateWeather(station.condTxtD);
 
   const soc = parseFloat(inv.batteryCapacitySoc || inv.batteryPercent || 100);
   const soh = parseFloat(inv.batteryHealthSoh || 100);
@@ -139,10 +152,24 @@ function formatReport(inv) {
   const pvPower = parseFloat(inv.pac || 0);
   const loadPower = parseFloat(inv.totalLoadPower || 0);
 
-  const daySolarKwh = parseFloat(inv.homeLoadTodayEnergy || 0);
-  const monthSolarKwh = parseFloat(inv.homeLoadMonthEnergy || 0);
-  const batChargedToday = parseFloat(inv.batteryTodayChargeEnergy || 0);
-  const batDischargedToday = parseFloat(inv.batteryTodayDischargeEnergy || 0);
+  // String 1 & String 2 (ทิศทางแผง / MPPT)
+  const pow1 = parseFloat(inv.pow1 || inv.mpptPow1 || 0);
+  const uPv1 = parseFloat(inv.uPv1 || inv.mpptUpv1 || 0);
+  const iPv1 = parseFloat(inv.iPv1 || inv.mpptIpv1 || 0);
+
+  const pow2 = parseFloat(inv.pow2 || inv.mpptPow2 || 0);
+  const uPv2 = parseFloat(inv.uPv2 || inv.mpptUpv2 || 0);
+  const iPv2 = parseFloat(inv.iPv2 || inv.mpptIpv2 || 0);
+
+  // Inverter Temp & Grid Voltage
+  const invTemp = parseFloat(inv.inverterTemperature || 0);
+  const gridVolt = parseFloat(inv.uAc1 || 0);
+
+  // Energy & Financial (NO CO2)
+  const daySolarKwh = parseFloat(station.dayEnergy || inv.homeLoadTodayEnergy || 0);
+  const monthSolarKwh = parseFloat(station.monthEnergy || inv.homeLoadMonthEnergy || 0);
+  const batChargedToday = parseFloat(station.batteryTodayChargeEnergy || inv.batteryTodayChargeEnergy || 0);
+  const batDischargedToday = parseFloat(station.batteryTodayDischargeEnergy || inv.batteryTodayDischargeEnergy || 0);
 
   const savingsToday = daySolarKwh * CONFIG.ELECTRICITY_RATE_THB;
   const savingsMonth = monthSolarKwh * CONFIG.ELECTRICITY_RATE_THB;
@@ -178,7 +205,7 @@ function formatReport(inv) {
   const gridText = `• 🔌 ไฟหลวง (Grid): \`${gridPower.toFixed(2)} kW\`` + (gridPower <= 0.05 ? " *(Self-Powered 100%)*" : "");
 
   return `☀️ **SOLIS ENERGY MONITOR**
-⏱ *อัปเดต: ${timeStr} | สถานะ: ${batStatusHeader}*
+⏱ *อัปเดต: ${timeStr} | สภาพอากาศ: ${weatherStr}*
 ──────────────────
 🔋 **สถานะแบตเตอรี่ (Battery State)**
 • ระดับแบต: \`[${bar}] ${soc.toFixed(0)}%\` *(${currentKwh.toFixed(1)} / ${CONFIG.BATTERY_CAPACITY_KWH.toFixed(1)} kWh)*
@@ -187,9 +214,12 @@ ${batSubText}
 • 🛡️ *ตั้งค่า Cut-off สำรองไฟไว้ที่: ${cutoffSoc.toFixed(0)}% (${cutoffKwh.toFixed(1)} kWh)*
 
 ⚡ **การไหลของพลังงาน (Power Flow)**
-• ☀️ แผงโซล่าเซลล์: \`${pvPower.toFixed(2)} kW\`
+• ☀️ แผงโซล่าเซลล์รวม: \`${pvPower.toFixed(2)} kW\`
+  ├ 🧭 สตริง 1: \`${pow1.toFixed(0)} W\` *(${uPv1.toFixed(1)}V / ${iPv1.toFixed(1)}A)*
+  └ 🧭 สตริง 2: \`${pow2.toFixed(0)} W\` *(${uPv2.toFixed(1)}V / ${iPv2.toFixed(1)}A)*
 • 🏠 โหลดใช้ในบ้าน: \`${loadPower.toFixed(2)} kW\`
 ${gridText}
+• 🌡️ ความร้อน Inverter: \`${invTemp.toFixed(1)}°C\` | ไฟหลวง: \`${gridVolt.toFixed(1)}V\`
 
 💰 **สรุปยอดวันนี้ (Today Summary)**
 • ไฟที่ผลิตได้วันนี้: \`${daySolarKwh.toFixed(2)} kWh\`
@@ -219,13 +249,18 @@ export default {
         const text = update.message.text.trim().toLowerCase();
 
         if (["/status", "/solar", "/soral", "/battery", "/start", "status", "solar", "ไฟ"].includes(text)) {
-          // Send pending message
           ctx.waitUntil(sendTelegram(chatId, "⏳ กำลังดึงข้อมูลสดจาก Solis Inverter สักครู่นะครับ..."));
 
-          // Fetch live inverter detail
-          const invRes = await callSolisApi("/v1/api/inverterDetail", { sn: CONFIG.SOLIS_INVERTER_SN });
-          if (invRes && invRes.data) {
-            const msg = formatReport(invRes.data);
+          const [stationRes, invRes] = await Promise.all([
+            callSolisApi("/v1/api/userStationList", { pageNo: 1, pageSize: 10 }),
+            callSolisApi("/v1/api/inverterDetail", { sn: CONFIG.SOLIS_INVERTER_SN })
+          ]);
+
+          const stationData = stationRes?.data?.page?.records?.[0] || stationRes?.data?.[0] || {};
+          const invData = invRes?.data || {};
+
+          if (invData && Object.keys(invData).length > 0) {
+            const msg = formatReport(stationData, invData);
             await sendTelegram(chatId, msg);
           } else {
             await sendTelegram(chatId, `⚠️ SolisCloud แจ้งเตือน: ${invRes?.msg || "ไม่สามารถดึงข้อมูลได้"}`);
