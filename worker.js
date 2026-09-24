@@ -270,8 +270,19 @@ function formatLineReport(station, inv) {
     evText = "🚗 ชาร์จรถ EV: แดดหมดแล้ว แนะนำตั้งเวลาชาร์จหลัง 22:00 น. ค่าไฟจะถูกสุด";
   }
 
+  // คำนวณประมาณการซื้อไฟหลวงทั้งเดือน
+  const dayOfMonth = thTime.getDate();
+  const daysInMonth = new Date(thTime.getFullYear(), thTime.getMonth() + 1, 0).getDate();
+  const gridPurchasedMonth = parseFloat(station.gridPurchasedMonthEnergy || inv.gridPurchasedMonthEnergy || 0);
+  const costGridMonth = gridPurchasedMonth * CONFIG.ELECTRICITY_RATE_THB;
+  const projectedGridCost = (gridPurchasedMonth / Math.max(1, dayOfMonth)) * daysInMonth * CONFIG.ELECTRICITY_RATE_THB;
+
   // ยอดเงิน
-  const moneyText = `💰 ความคุ้มค่าวันนี้:\n• วันนี้ช่วยเซฟค่าไฟไปแล้ว: ~${savingsToday.toFixed(0)} บาท\n• สะสมเดือนนี้ประหยัดได้: ~${savingsMonth.toFixed(0)} บาท`;
+  const moneyText = `💰 ค่าไฟ & การประหยัดเงิน:
+• วันนี้ช่วยเซฟค่าไฟ: ~${savingsToday.toFixed(0)} บาท
+• ซื้อไฟหลวงเดือนนี้ (${dayOfMonth} วัน): ~${costGridMonth.toFixed(0)} บาท
+  👉 ประมาณการทั้งเดือน: จ่ายไฟหลวง ~${projectedGridCost.toFixed(0)} บาท
+• สะสมเดือนนี้ประหยัดได้: ~${savingsMonth.toFixed(0)} บาท`;
 
   return `☀️ รายงานไฟโซล่าเซลล์บ้าน (${timeStr})
 สภาพอากาศ: ${weatherStr}
@@ -334,23 +345,26 @@ function formatTelegramReport(station, inv) {
   const stationName = station.stationName || "JJKWT’s Home";
   const faultDesc = inv.faultCodeDesc || "Generating";
 
+  const dayOfMonth = thTime.getDate();
+  const daysInMonth = new Date(thTime.getFullYear(), thTime.getMonth() + 1, 0).getDate();
+
   const daySolarKwh = parseFloat(station.dayEnergy || inv.homeLoadTodayEnergy || 0);
   const gridPurchasedToday = parseFloat(station.gridPurchasedTodayEnergy || inv.gridPurchasedTodayEnergy || 0);
   const gridSellToday = parseFloat(station.gridSellTodayEnergy || inv.gridSellTodayEnergy || 0);
   const homeLoadToday = parseFloat(station.homeLoadTodayEnergy || inv.homeLoadTodayEnergy || 0);
 
-  const homeLoadYest = parseFloat(inv.homeLoadYesterdayEnergy || 0);
-  const gridPurchasedYest = parseFloat(inv.gridPurchasedYesterdayEnergy || 0);
-
   const monthSolarKwh = parseFloat(station.monthEnergy || inv.homeLoadMonthEnergy || 0);
-  const allEnergy = parseFloat(station.allEnergy || inv.eTotal || 0);
-  const gridPurchasedTotal = parseFloat(station.gridPurchasedTotalEnergy || inv.gridPurchasedTotalEnergy || 0);
-  const gridSellTotal = parseFloat(station.gridSellTotalEnergy || inv.gridSellTotalEnergy || 0);
-  const homeLoadTotal = parseFloat(station.homeLoadTotalEnergy || inv.homeLoadTotalEnergy || 0);
+  const gridPurchasedMonth = parseFloat(station.gridPurchasedMonthEnergy || inv.gridPurchasedMonthEnergy || 0);
+  const costGridMonth = gridPurchasedMonth * CONFIG.ELECTRICITY_RATE_THB;
+  const projectedGridKwh = (gridPurchasedMonth / Math.max(1, dayOfMonth)) * daysInMonth;
+  const projectedGridCost = projectedGridKwh * CONFIG.ELECTRICITY_RATE_THB;
+
+  const homeLoadMonth = parseFloat(station.homeLoadMonthEnergy || inv.homeLoadMonthEnergy || 0);
+  const solarOffsetPct = homeLoadMonth > 0 ? Math.min(100, Math.round((monthSolarKwh / homeLoadMonth) * 100)) : 0;
 
   const savingsToday = daySolarKwh * CONFIG.ELECTRICITY_RATE_THB;
+  const costTodayGrid = gridPurchasedToday * CONFIG.ELECTRICITY_RATE_THB;
   const savingsMonth = monthSolarKwh * CONFIG.ELECTRICITY_RATE_THB;
-  const savingsAll = allEnergy * CONFIG.ELECTRICITY_RATE_THB;
 
   const bar = getProgressBar(soc);
 
@@ -413,19 +427,12 @@ ${batChargedYest > 0 || batDischargedYest > 0 ? `• 📆 เมื่อวา�
 🚗 **คำแนะนำชาร์จรถ EV:**
 • ${evAdvice}
 
-💰 **สถิติพลังงานและการประหยัดเงิน** *(คิดที่ ${CONFIG.ELECTRICITY_RATE_THB} บ./หน่วย)*
-• 📅 **วันนี้ (Today):**
-  ├ ☀️ ผลิตไฟได้: \`${daySolarKwh.toFixed(2)} kWh\` *(💵 ประหยัด ~${savingsToday.toFixed(2)} บาท)*
-  ├ 🔌 ดึงไฟหลวงมาใช้: \`${gridPurchasedToday.toFixed(2)} kWh\` | ขายไฟคืน: \`${gridSellToday.toFixed(2)} kWh\`
-  └ 🏠 บ้านใช้ไฟทั้งหมด: \`${homeLoadToday.toFixed(2)} kWh\`
-${homeLoadYest > 0 ? `• 📆 **เมื่อวาน (Yesterday):** บ้านใช้ไฟ \`${homeLoadYest.toFixed(2)} kWh\` | ซื้อไฟหลวง \`${gridPurchasedYest.toFixed(2)} kWh\`\n` : ""}• 📈 **เดือนนี้สะสม (Month-to-Date):**
-  └ ☀️ ผลิตได้: \`${monthSolarKwh.toFixed(2)} kWh\` *(💵 ประหยัด ~${savingsMonth.toFixed(2)} บาท)*
-• 🏆 **ตลอดอายุการใช้งาน (Lifetime):**
-  ├ ☀️ ผลิตไฟรวม: \`${allEnergy.toFixed(2)} kWh\` *(ประหยัดสะสม ~${savingsAll.toFixed(2)} บาท)*
-  ├ 🔌 ซื้อไฟหลวงสะสม: \`${gridPurchasedTotal.toFixed(2)} kWh\` | ขายไฟคืน: \`${gridSellTotal.toFixed(2)} kWh\`
-  └ 🏠 บ้านใช้ไฟสะสมรวม: \`${homeLoadTotal.toFixed(2)} kWh\`
-──────────────────
-Solis SN: \`${inv.sn || CONFIG.SOLIS_INVERTER_SN}\` | Batt SN: \`${inv.batterySn || "-"}\``;
+💰 **สรุปค่าไฟ & ประหยัดเงิน (เรท ${CONFIG.ELECTRICITY_RATE_THB.toFixed(2)} บ./หน่วย)**
+• ☀️ **วันนี้:** ผลิตได้ \`${daySolarKwh.toFixed(1)} kWh\` *(เซฟ ~${savingsToday.toFixed(0)} บ.)* | ดึงไฟหลวง \`${gridPurchasedToday.toFixed(1)} kWh\` *(~${costTodayGrid.toFixed(0)} บ.)*
+• 🔌 **ซื้อไฟหลวงเดือนนี้ (${dayOfMonth} วัน):** \`${gridPurchasedMonth.toFixed(1)} kWh\` (~${costGridMonth.toFixed(0)} บาท)
+  👉 **ประมาณการค่าไฟหลวงทั้งเดือน:** \`~${projectedGridCost.toFixed(0)} บาท\` *(${projectedGridKwh.toFixed(0)} kWh)*
+• 📈 **โซล่าเซฟเงินสะสมเดือนนี้:** \`~${savingsMonth.toFixed(0)} บาท\` *(${monthSolarKwh.toFixed(1)} kWh)*
+• 🏠 **สัดส่วนไฟฟรี:** โซล่าเซลล์ช่วยจ่ายไฟบ้านไป \`${solarOffsetPct}%\``;
 }
 
 function cleanForLine(text) {
