@@ -178,8 +178,8 @@ function getEvChargingAdvice(nowHour, soc, pvPower, loadPower) {
 
 // คำสั่งที่อนุญาตให้พิมพ์เดี่ยวๆ (Exact Match เท่านั้น) เพื่อไม่ให้เด้งเวลาคุยเรื่องอื่น
 const VALID_COMMANDS = new Set([
-  "ไฟ", "ดูไฟ", "เช็คไฟ", "ค่าไฟ",
-  "แบต", "ดูแบต", "เช็คแบต",
+  "ไฟ", "ดูไฟ", "เช็คไฟ", "ค่าไฟ", "สรุปไฟ", "ไฟบ้าน",
+  "แบต", "ดูแบต", "เช็คแบต", "แบตเตอรี่",
   "โซล่า", "โซลาร์", "สถานะ",
   "status", "solar", "battery", "ev",
   "/status", "/solar", "/start", "/battery", "/ev"
@@ -546,6 +546,19 @@ function cleanForLine(text) {
   return text.replace(/\*\*/g, "").replace(/\*/g, "").replace(/`/g, "");
 }
 
+async function sendChatAction(chatId, action = "typing") {
+  try {
+    const url = `https://api.telegram.org/bot${CONFIG.TELEGRAM_BOT_TOKEN}/sendChatAction`;
+    await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, action: action })
+    });
+  } catch (e) {
+    // Ignore error
+  }
+}
+
 async function sendTelegram(chatId, text) {
   const url = `https://api.telegram.org/bot${CONFIG.TELEGRAM_BOT_TOKEN}/sendMessage`;
   await fetch(url, {
@@ -605,7 +618,8 @@ async function handleLineEvent(event) {
     }
 
     if (event.type === "message" && event.message?.type === "text") {
-      const text = (event.message.text || "").trim().toLowerCase();
+      const rawText = (event.message.text || "").trim();
+      const text = rawText.toLowerCase();
       const isGroup = event.source?.type === "group" || event.source?.type === "room";
       const targetId = event.source?.groupId || event.source?.roomId || event.source?.userId;
 
@@ -617,7 +631,7 @@ async function handleLineEvent(event) {
       }
 
       // ตรวจจับเฉพาะคำสั่งเดี่ยวๆ (Exact Match)
-      if (VALID_COMMANDS.has(text)) {
+      if (VALID_COMMANDS.has(text) || VALID_COMMANDS.has(rawText)) {
         const { stationData, invData, dayData } = await getSolarData();
         const msg = formatLineReport(stationData, invData, dayData);
         const replied = await sendLineReply(replyToken, msg);
@@ -719,11 +733,13 @@ export default {
       // Telegram Webhook
       if (body.message && body.message.text) {
         const chatId = body.message.chat.id;
-        const text = body.message.text.trim().toLowerCase();
+        const rawText = body.message.text.trim();
+        const text = rawText.split("@")[0].trim().toLowerCase();
 
         // ตรวจจับเฉพาะคำสั่งเดี่ยวๆ (Exact Match)
-        if (VALID_COMMANDS.has(text)) {
+        if (VALID_COMMANDS.has(text) || VALID_COMMANDS.has(rawText.toLowerCase())) {
           ctx.waitUntil((async () => {
+            await sendChatAction(chatId, "typing");
             const { stationData, invData, dayData, colData, alarmData } = await getSolarData();
             const msg1 = formatTelegramReport1(stationData, invData, dayData);
             const msg2 = formatTelegramReport2(stationData, invData, dayData, colData, alarmData);
