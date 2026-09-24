@@ -154,18 +154,66 @@ function translateWeather(cond) {
   return `${cond} ⛅`;
 }
 
-function getEvChargingAdvice(nowHour, soc, pvPower, loadPower) {
-  const excessSolar = Math.max(0, pvPower - loadPower);
+// โมเดลคำนวณแดดตามมุมองศาพระอาทิตย์จริง (Sun Angle Curve)
+function getSolarTimeFactor(hour, minute) {
+  const t = hour + minute / 60.0;
+  if (t <= 6.5 || t >= 18.0) return 0;
+  const normalized = (t - 6.5) / (18.0 - 6.5);
+  const sinVal = Math.sin(normalized * Math.PI);
+  return Math.max(0, Math.pow(sinVal, 1.2));
+}
+
+// โมเดลคำนวณตัวคูณสภาพอากาศจริง (Weather Factor)
+function getWeatherFactor(cond) {
+  if (!cond) return 0.8;
+  const c = cond.toLowerCase();
+  if (c.includes("rain") || c.includes("shower") || c.includes("thunder")) return 0.4;
+  if (c.includes("overcast") || c.includes("cloud")) return 0.65;
+  if (c.includes("sunny") || c.includes("clear")) return 1.0;
+  return 0.8;
+}
+
+// คำนวณแดดเหลือทิ้งที่แท้จริง (Dynamic Solar Curtailment Model)
+function calculateSolarCurtailment(thHour, thMinute, weatherCond, peakPowerKw, pvPower, loadPower, soc) {
+  const t = thHour + thMinute / 60.0;
+  // หลัง 16:30 แดดจะเริ่มอ่อนมาก ไม่ถือว่ามีแดดเหลือทิ้งที่มีนัยสำคัญ
+  if (t < 9.0 || t > 16.5) {
+    return { isCurtailing: false, potentialKw: pvPower, wastedKw: 0 };
+  }
+
+  // ระบบจะหรี่ไฟเมื่อแบตเต็ม (>= 95%) และแผงผลิตเท่ากับโหลดบ้าน
+  const isCurtailing = (soc >= 95 && pvPower <= loadPower + 0.8);
+  if (!isCurtailing) {
+    return { isCurtailing: false, potentialKw: pvPower, wastedKw: 0 };
+  }
+
+  const timeFactor = getSolarTimeFactor(thHour, thMinute);
+  const weatherFactor = getWeatherFactor(weatherCond);
+  const baseNoonPeak = Math.max(peakPowerKw || 0, 8.5);
+
+  const potentialKw = Math.max(pvPower, baseNoonPeak * timeFactor * weatherFactor);
+  const wastedKw = Math.max(0, potentialKw - loadPower);
+
+  return {
+    isCurtailing: wastedKw >= 0.5,
+    potentialKw: parseFloat(potentialKw.toFixed(2)),
+    wastedKw: parseFloat(wastedKw.toFixed(1))
+  };
+}
+
+function getEvChargingAdvice(nowHour, soc, pvPower, loadPower, wastedKw = 0) {
   if (nowHour >= 22 || nowHour < 6) {
     return "⚡ ช่วง Off-Peak (ค่าไฟถูกสุด) สามารถเสียบชาร์จรถ EV ได้คุ้มค่าที่สุด";
   } else if (nowHour >= 6 && nowHour < 10) {
     return "☀️ แดดช่วงเช้ากำลังชาร์จเข้าแบตเตอรี่บ้าน แนะนำรอให้แบตเตอรี่เต็มก่อน";
   } else if (nowHour >= 10 && nowHour < 16) {
     if (soc >= 95) {
-      if (excessSolar >= 1.5) {
-        return `🟢 แบตบ้านเต็มแล้ว + มีแดดเหลือ \`${excessSolar.toFixed(1)} kW\` เสียบชาร์จรถ EV ฟรีได้เลย! 🚗⚡`;
+      if (wastedKw >= 3.0) {
+        return `🟢 แบตบ้านเต็มแล้ว + มีแดดเหลือ \`~${wastedKw.toFixed(1)} kW\` เสียบชาร์จรถ EV ฟรีได้เลย! 🚗⚡`;
+      } else if (wastedKw >= 1.0) {
+        return `🟡 แบตบ้านเต็มแล้ว แต่แดดช่วงนี้เหลือ \`~${wastedKw.toFixed(1)} kW\` (แนะนำชาร์จแบบปรับกระแสเบาๆ หรือเปิดแอร์แทน)`;
       } else {
-        return "🟢 แบตบ้านเต็มแล้ว สามารถเริ่มชาร์จรถได้ (ปรับกระแสชาร์จให้พอดีกับแดด)";
+        return "🟢 แบตบ้านเต็มแล้ว หากจะชาร์จรถ แนะนำรอแดดแรงขึ้น หรือตั้งชาร์จช่วง Off-Peak 22:00 น.";
       }
     } else {
       return `⏳ แบตบ้านอยู่ที่ \`${soc.toFixed(0)}%\` แนะนำรอให้แบตเต็มก่อน เพื่อไม่ให้รถแย่งไฟแบตเตอรี่บ้าน`;
@@ -250,39 +298,48 @@ function formatLineReport(station, inv, dayData) {
     powerFlowText += `\n• 🔋 ไฟแดดที่เหลือ ${Math.abs(batPower).toFixed(2)} kW กำลังชาร์จเข้าแบต`;
   }
 
-  // ตรวจสอบแดดเหลือทิ้ง (Curtailment)
-  const thHour = thTime.getHours();
-  if (thHour >= 10 && thHour < 16 && soc >= 95 && pvPower <= loadPower + 0.8) {
-    let peakW = 0;
-    if (Array.isArray(dayData)) {
-      for (const item of dayData) {
-        const p = parseFloat(item.power || item.produceEnergy || 0);
-        if (p > peakW) peakW = p;
-      }
+  // คำนวณพีคแดดวันนี้
+  let peakW = 0;
+  if (Array.isArray(dayData)) {
+    for (const item of dayData) {
+      const p = parseFloat(item.power || item.produceEnergy || 0);
+      if (p > peakW) peakW = p;
     }
-    const potentialKw = Math.max(peakW / 1000.0, 7.5);
-    const wastedKw = Math.max(0, potentialKw - loadPower);
-    if (wastedKw >= 1.5) {
-      powerFlowText += `\n• ☀️ แดดเหลือทิ้ง: ~${wastedKw.toFixed(1)} kW (แบตเต็มแล้ว เปิดแอร์เพิ่มหรือชาร์จรถ EV ฟรีได้เลย!)`;
-    }
+  }
+  const peakPowerKw = peakW / 1000.0;
+
+  // ตรวจจับแดดเหลือทิ้งด้วย Dynamic Solar Model
+  const curtailment = calculateSolarCurtailment(
+    thTime.getHours(),
+    thTime.getMinutes(),
+    station.condTxtD,
+    peakPowerKw,
+    pvPower,
+    loadPower,
+    soc
+  );
+  if (curtailment.isCurtailing && curtailment.wastedKw >= 0.8) {
+    powerFlowText += `\n• ☀️ แดดเหลือทิ้ง: ~${curtailment.wastedKw.toFixed(1)} kW (แบตเต็มแล้ว เปิดแอร์เพิ่มหรือใช้ไฟฟรีได้เลย!)`;
   }
 
   // แนะนำรถ EV
   let evText = "";
-  const excessSolar = Math.max(0, pvPower - loadPower);
+  const thHour = thTime.getHours();
   if (thHour >= 22 || thHour < 6) {
     evText = "🚗 ชาร์จรถ EV: ช่วงนี้ค่าไฟถูกสุด (Off-Peak) เสียบชาร์จได้เลย";
   } else if (thHour >= 6 && thHour < 10) {
     evText = "🚗 ชาร์จรถ EV: รอให้แดดชาร์จแบตบ้านให้เต็มก่อนครับ";
   } else if (thHour >= 10 && thHour < 16) {
     if (soc >= 95) {
-      if (excessSolar >= 1.5) {
-        evText = `🚗 ชาร์จรถ EV: แบตบ้านเต็มแล้ว + มีแดดเหลือ ${excessSolar.toFixed(1)} kW เสียบชาร์จฟรีได้เลย!`;
+      if (curtailment.wastedKw >= 3.0) {
+        evText = `🚗 ชาร์จรถ EV: แบตบ้านเต็มแล้ว + มีแดดเหลือ ~${curtailment.wastedKw.toFixed(1)} kW เสียบชาร์จฟรีได้เลย!`;
+      } else if (curtailment.wastedKw >= 1.0) {
+        evText = `🚗 ชาร์จรถ EV: แบตบ้านเต็มแล้ว แต่แดดช่วงนี้เหลือ ~${curtailment.wastedKw.toFixed(1)} kW (แนะนำชาร์จกระแสเบาๆ หรือเปิดแอร์แทน)`;
       } else {
         evText = "🚗 ชาร์จรถ EV: แบตบ้านเต็มแล้ว เริ่มเสียบชาร์จได้ครับ";
       }
     } else {
-      evText = `🚗 ชาร์จรถ EV: รอแบตเตอรี่บ้านเต็มก่อน (ช่วงบ่าย) จะได้ไม่แย่งไฟบ้าน`;
+      evText = "🚗 ชาร์จรถ EV: รอแบตเตอรี่บ้านเต็มก่อน (ช่วงบ่าย) จะได้ไม่แย่งไฟบ้าน";
     }
   } else {
     evText = "🚗 ชาร์จรถ EV: แดดหมดแล้ว แนะนำตั้งเวลาชาร์จหลัง 22:00 น. ค่าไฟจะถูกสุด";
@@ -387,30 +444,49 @@ function formatTelegramReport1(station, inv, dayData) {
     batSubDetail = `• กำลังจ่ายไฟออก: \`-${powerKw.toFixed(2)} kW\` (${batCurr.toFixed(1)}A / ${batVolt.toFixed(1)}V)\n• ⏳ **ใช้งานต่อได้อีก:** \`${h} ชม. ${m} นาที\` *(คาดว่าหมด ${estStr})*`;
   }
 
-  // ตรวจจับแดดเหลือทิ้ง (Curtailment)
+  // ตรวจจับแดดเหลือทิ้งด้วย Dynamic Solar Model
   const thHour = thTime.getHours();
+  const thMinute = thTime.getMinutes();
+  const curtailment = calculateSolarCurtailment(
+    thHour,
+    thMinute,
+    station.condTxtD,
+    peakPowerKw,
+    pvPower,
+    loadPower,
+    soc
+  );
+
   let solarCurtailmentText = "";
-  if (thHour >= 9 && thHour < 16) {
-    if (soc >= 95 && pvPower <= loadPower + 0.8) {
-      const potentialKw = Math.max(peakPowerKw, 7.5);
-      const wastedKw = Math.max(0, potentialKw - loadPower);
-      solarCurtailmentText = `☀️ **แดดเหลือทิ้ง (Solar Curtailment):** \`~${wastedKw.toFixed(1)} kW\` ⚠️
+  if (curtailment.isCurtailing && curtailment.wastedKw >= 0.8) {
+    const wasted = curtailment.wastedKw;
+    let applianceText = "";
+    if (wasted >= 4.0) {
+      applianceText = `  ├ 🚗 เสียบชาร์จรถ EV ฟรีได้ทันที \`~${Math.min(7.0, wasted).toFixed(1)} kW\`\n  ├ ❄️ หรือเปิดแอร์ 12,000-18,000 BTU ได้ฟรีอีก \`${Math.floor(wasted / 1.0)} ตัว\`\n  └ 🧺 ซักผ้า / อบผ้า / ปั๊มน้ำ ฟรี 100% จากแสงแดด!`;
+    } else if (wasted >= 1.5) {
+      applianceText = `  ├ ❄️ แนะนำเปิดแอร์ 12,000-18,000 BTU ได้ฟรีอีก \`${Math.floor(wasted / 1.0)} ตัว\`\n  ├ 🧺 หรือซักผ้า / อบผ้า / ปั๊มน้ำ ฟรีจากแดด\n  └ 🚗 ชาร์จรถ EV (ชาร์จแบบปรับกระแสเบาๆ ~${wasted.toFixed(1)} kW)`;
+    } else {
+      applianceText = "  └ ❄️ แนะนำเปิดแอร์เพิ่มได้ฟรี 1 ตัว หรือซักผ้าฟรีจากแสงแดด";
+    }
+
+    solarCurtailmentText = `☀️ **แดดเหลือทิ้ง (Solar Curtailment):** \`~${wasted.toFixed(1)} kW\` ⚠️
 • แบตบ้านเต็มแล้ว + ไม่ได้ขายไฟคืน ระบบจึงหรี่กำลังผลิตลงตามโหลด
+• 🌤️ คาดการณ์แดดเวลานี้ (คำนวณตามมุมแดด & สภาพอากาศ): \`~${curtailment.potentialKw.toFixed(1)} kW\`
 • 💡 **โอกาสใช้ไฟฟรี:**
-  ├ 🚗 เสียบชาร์จรถ EV ฟรีได้ทันที \`~${Math.min(7.0, wastedKw).toFixed(1)} kW\`
-  ├ ❄️ หรือเปิดแอร์ 12,000-18,000 BTU ได้ฟรีอีก \`${Math.max(1, Math.floor(wastedKw / 1.0))} ตัว\`
-  └ 🧺 ซักผ้า / อบผ้า / ปั๊มน้ำ ฟรี 100% จากแสงแดด!`;
-    } else if (pvPower > 0.5) {
-      solarCurtailmentText = `☀️ **การเก็บเกี่ยวพลังงานแสงอาทิตย์:**
+${applianceText}`;
+  } else if (soc >= 95 && pvPower <= loadPower + 0.8) {
+    solarCurtailmentText = `☀️ **การรับพลังงานแสงอาทิตย์:**
+• แบตเตอรี่บ้านเต็มแล้ว และระบบหรี่กำลังผลิตผลิตจ่ายพอดีกับโหลดในบ้าน (\`${pvPower.toFixed(2)} kW\`)`;
+  } else if (pvPower > 0.5) {
+    solarCurtailmentText = `☀️ **การเก็บเกี่ยวพลังงานแสงอาทิตย์:**
 • ผลิตได้เต็มกำลัง: \`${pvPower.toFixed(2)} kW\`
 • จ่ายให้บ้าน \`${loadPower.toFixed(2)} kW\` + ชาร์จเก็บแบตเตอรี่ \`${Math.abs(batPower).toFixed(2)} kW\` (ใช้งานคุ้มค่า ไม่สูญเปล่า)`;
-    }
   } else {
     solarCurtailmentText = `🌙 **ช่วงค่ำ:** แดดหมดแล้ว ระบบกำลังดึงไฟฟรีจากแบตเตอรี่จ่ายให้บ้าน`;
   }
 
   // คำแนะนำ EV
-  const evAdvice = getEvChargingAdvice(thHour, soc, pvPower, loadPower);
+  const evAdvice = getEvChargingAdvice(thHour, soc, pvPower, loadPower, curtailment.wastedKw);
 
   // คำนวณสรุปการเงิน
   const dayOfMonth = thTime.getDate();
