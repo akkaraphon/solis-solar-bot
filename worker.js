@@ -174,11 +174,124 @@ function getEvChargingAdvice(nowHour, soc, pvPower, loadPower) {
   return "💡 ตรวจสอบระดับแบตเตอรี่และแดดก่อนเสียบชาร์จ";
 }
 
-function formatReport(station, inv) {
+// คำสั่งที่อนุญาตให้พิมพ์เดี่ยวๆ (Exact Match เท่านั้น) เพื่อไม่ให้เด้งเวลาคุยเรื่องอื่น
+const VALID_COMMANDS = new Set([
+  "ไฟ", "ดูไฟ", "เช็คไฟ", "ค่าไฟ",
+  "แบต", "ดูแบต", "เช็คแบต",
+  "โซล่า", "โซลาร์", "สถานะ",
+  "status", "solar", "battery", "ev",
+  "/status", "/solar", "/start", "/battery", "/ev"
+]);
+
+// 1. ฟอร์แมตสำหรับ LINE (สั้น กระชับ ภาษาชาวบ้าน ผู้ใหญ่อ่าน 3 วินาทีเข้าใจ)
+function formatLineReport(station, inv) {
   const now = new Date();
   const thTime = new Date(now.getTime() + (7 * 60 + now.getTimezoneOffset()) * 60000);
   const timeStr = `${String(thTime.getHours()).padStart(2, "0")}:${String(thTime.getMinutes()).padStart(2, "0")} น.`;
+  const weatherStr = translateWeather(station.condTxtD);
 
+  const soc = parseFloat(inv.batteryCapacitySoc || inv.batteryPercent || 100);
+  const cutoffSoc = parseFloat(inv.socDischargeSet || 10);
+  const batPower = parseFloat(inv.batteryPower || inv.batteryPowerBms || 0) / (inv.batteryPower > 100 ? 1000 : 1);
+  const batDir = inv.batteryDirection || 0;
+
+  const pvPower = parseFloat(inv.pac || 0);
+  const loadPower = parseFloat(inv.totalLoadPower || 0);
+  const gridPower = Math.max(0, loadPower - pvPower);
+
+  const daySolarKwh = parseFloat(station.dayEnergy || inv.homeLoadTodayEnergy || 0);
+  const monthSolarKwh = parseFloat(station.monthEnergy || 0);
+  const savingsToday = daySolarKwh * CONFIG.ELECTRICITY_RATE_THB;
+  const savingsMonth = monthSolarKwh * CONFIG.ELECTRICITY_RATE_THB;
+
+  const bar = getProgressBar(soc);
+
+  // สรุปสถานะหลักแบบเข้าใจง่าย (คนแก่รู้ทันทีว่าเสียเงินไหม)
+  let statusSummary = "";
+  if (gridPower <= 0.05) {
+    if (pvPower > 0.1) {
+      statusSummary = "🟢 ตอนนี้บ้านใช้ไฟฟรีจากแดด 100%\n(ไม่ได้ดึงไฟหลวงเลย ไม่เสียเงินสักบาท)";
+    } else {
+      statusSummary = "🟢 ตอนนี้บ้านใช้ไฟฟรีจากแบตเตอรี่\n(แดดหมดแล้ว แต่ยังใช้ไฟฟรีจากแบตที่เก็บไว้)";
+    }
+  } else {
+    statusSummary = `🟡 ตอนนี้มีดึงไฟหลวงช่วย ${gridPower.toFixed(2)} kW\n(ใช้ไฟเยอะกว่าที่แดดและแบตจ่ายไหว)`;
+  }
+
+  // สถานะแบตเตอรี่
+  let batSummary = `🔋 แบตเตอรี่บ้าน: ${soc.toFixed(0)}% [${bar}]`;
+  if (soc >= 99.5) {
+    batSummary += `\n• ชาร์จเต็ม 100% แล้ว พร้อมใช้งานยาวๆ`;
+  } else if (batPower > 0.05 || batDir === 1) {
+    const powerKw = Math.abs(batPower) || 0.1;
+    const kwhNeeded = Math.max(0, ((100 - soc) / 100) * CONFIG.BATTERY_CAPACITY_KWH);
+    const totalMins = Math.round((kwhNeeded / powerKw) * 60);
+    const estTime = new Date(thTime.getTime() + totalMins * 60000);
+    const estStr = `${String(estTime.getHours()).padStart(2, "0")}:${String(estTime.getMinutes()).padStart(2, "0")} น.`;
+    batSummary += `\n• กำลังชาร์จไฟเข้าแบต (+${powerKw.toFixed(2)} kW)\n• ⏳ คาดว่าจะเต็ม 100% ประมาณ ${estStr}`;
+  } else if (batPower < -0.05 || batDir === 2) {
+    const powerKw = Math.abs(batPower);
+    const usableKwh = Math.max(0, ((soc - cutoffSoc) / 100) * CONFIG.BATTERY_CAPACITY_KWH);
+    const hrs = powerKw > 0.05 ? usableKwh / powerKw : 0;
+    const h = Math.floor(hrs);
+    const m = Math.round((hrs - h) * 60);
+    const estTime = new Date(thTime.getTime() + (h * 60 + m) * 60000);
+    const estStr = `${String(estTime.getHours()).padStart(2, "0")}:${String(estTime.getMinutes()).padStart(2, "0")} น.`;
+    batSummary += `\n• กำลังจ่ายไฟออกให้บ้าน (-${powerKw.toFixed(2)} kW)\n• ⏳ ใช้งานต่อได้อีก ${h} ชม. ${m} นาที (คาดว่าหมด ${estStr})`;
+  } else {
+    batSummary += `\n• แบตเตอรี่สแตนด์บาย (พร้อมจ่ายไฟเมื่อจำเป็น)`;
+  }
+
+  // การใช้ไฟ
+  let powerFlowText = `🏠 การใช้ไฟในบ้าน:\n• ☀️ แดดผลิตไฟได้: ${pvPower.toFixed(2)} kW\n• 🏠 ในบ้านกำลังเปิดไฟ/แอร์: ${loadPower.toFixed(2)} kW`;
+  if (batPower > 0.05 && pvPower > loadPower) {
+    powerFlowText += `\n• 🔋 ไฟแดดที่เหลือ ${Math.abs(batPower).toFixed(2)} kW กำลังชาร์จเข้าแบต`;
+  }
+
+  // แนะนำรถ EV
+  let evText = "";
+  const thHour = thTime.getHours();
+  const excessSolar = Math.max(0, pvPower - loadPower);
+  if (thHour >= 22 || thHour < 6) {
+    evText = "🚗 ชาร์จรถ EV: ช่วงนี้ค่าไฟถูกสุด (Off-Peak) เสียบชาร์จได้เลย";
+  } else if (thHour >= 6 && thHour < 10) {
+    evText = "🚗 ชาร์จรถ EV: รอให้แดดชาร์จแบตบ้านให้เต็มก่อนครับ";
+  } else if (thHour >= 10 && thHour < 16) {
+    if (soc >= 95) {
+      if (excessSolar >= 1.5) {
+        evText = `🚗 ชาร์จรถ EV: แบตบ้านเต็มแล้ว + มีแดดเหลือ ${excessSolar.toFixed(1)} kW เสียบชาร์จฟรีได้เลย!`;
+      } else {
+        evText = "🚗 ชาร์จรถ EV: แบตบ้านเต็มแล้ว เริ่มเสียบชาร์จได้ครับ";
+      }
+    } else {
+      evText = `🚗 ชาร์จรถ EV: รอแบตเตอรี่บ้านเต็มก่อน (ช่วงบ่าย) จะได้ไม่แย่งไฟบ้าน`;
+    }
+  } else {
+    evText = "🚗 ชาร์จรถ EV: แดดหมดแล้ว แนะนำตั้งเวลาชาร์จหลัง 22:00 น. ค่าไฟจะถูกสุด";
+  }
+
+  // ยอดเงิน
+  const moneyText = `💰 ความคุ้มค่าวันนี้:\n• วันนี้ช่วยเซฟค่าไฟไปแล้ว: ~${savingsToday.toFixed(0)} บาท\n• สะสมเดือนนี้ประหยัดได้: ~${savingsMonth.toFixed(0)} บาท`;
+
+  return `☀️ รายงานไฟโซล่าเซลล์บ้าน (${timeStr})
+สภาพอากาศ: ${weatherStr}
+
+${statusSummary}
+
+${batSummary}
+
+${powerFlowText}
+
+${evText}
+
+${moneyText}`;
+}
+
+// 2. ฟอร์แมตสำหรับ Telegram (ละเอียดลึก ครบทุกข้อมูลที่ Solis API มี)
+function formatTelegramReport(station, inv) {
+  const now = new Date();
+  const thTime = new Date(now.getTime() + (7 * 60 + now.getTimezoneOffset()) * 60000);
+  const timeStr = `${String(thTime.getHours()).padStart(2, "0")}:${String(thTime.getMinutes()).padStart(2, "0")} น.`;
   const weatherStr = translateWeather(station.condTxtD);
 
   const soc = parseFloat(inv.batteryCapacitySoc || inv.batteryPercent || 100);
@@ -187,49 +300,76 @@ function formatReport(station, inv) {
   const currentKwh = (soc / 100.0) * CONFIG.BATTERY_CAPACITY_KWH;
   const cutoffKwh = (cutoffSoc / 100.0) * CONFIG.BATTERY_CAPACITY_KWH;
 
-  const batPower = parseFloat(inv.batteryPower || inv.batteryPowerBms || 0);
+  const batPower = parseFloat(inv.batteryPower || inv.batteryPowerBms || 0) / (inv.batteryPower > 100 ? 1000 : 1);
   const batDir = inv.batteryDirection || 0;
-  const pvPower = parseFloat(inv.pac || 0);
-  const loadPower = parseFloat(inv.totalLoadPower || 0);
+  const batVolt = parseFloat(inv.storageBatteryVoltage || inv.batteryVoltage || 0);
+  const batCurr = parseFloat(inv.storageBatteryCurrent || inv.bstteryCurrent || 0);
+  const maxChargeI = parseFloat(inv.batteryChargingCurrent || inv.batteryCMaxiSet || 0);
+  const maxDischargeI = parseFloat(inv.batteryDischargeLimiting || inv.batteryDMaxiSet || 0);
 
-  // ข้อมูลแยกสตริง 1 และ 2
+  const batChargedToday = parseFloat(station.batteryTodayChargeEnergy || inv.batteryTodayChargeEnergy || 0);
+  const batDischargedToday = parseFloat(station.batteryTodayDischargeEnergy || inv.batteryTodayDischargeEnergy || 0);
+  const batChargedYest = parseFloat(inv.batteryYesterdayChargeEnergy || 0);
+  const batDischargedYest = parseFloat(inv.batteryYesterdayDischargeEnergy || 0);
+
+  const pvPower = parseFloat(inv.pac || 0);
   const pow1 = parseFloat(inv.pow1 || inv.mpptPow1 || 0);
   const uPv1 = parseFloat(inv.uPv1 || inv.mpptUpv1 || 0);
   const iPv1 = parseFloat(inv.iPv1 || inv.mpptIpv1 || 0);
-
   const pow2 = parseFloat(inv.pow2 || inv.mpptPow2 || 0);
   const uPv2 = parseFloat(inv.uPv2 || inv.mpptUpv2 || 0);
   const iPv2 = parseFloat(inv.iPv2 || inv.mpptIpv2 || 0);
+  const dcBus = parseFloat(inv.dcBus || 0);
 
-  // อุณหภูมิและแรงดันไฟ
-  const invTemp = parseFloat(inv.inverterTemperature || 0);
+  const loadPower = parseFloat(inv.totalLoadPower || 0);
+  const gridPower = Math.max(0, loadPower - pvPower);
   const gridVolt = parseFloat(inv.uAc1 || 0);
+  const gridCurr = parseFloat(inv.iAc1 || inv.gridDetailVo?.gridCurrentA || 0);
+  const gridFreq = parseFloat(inv.fac || inv.gridDetailVo?.gridFac || 0);
+  const gridReactive = parseFloat(inv.gridDetailVo?.gridReactivePowerA || inv.reactivePower || 0);
 
-  // ยอดพลังงานและการเงิน (ไม่มี CO2)
+  const invTemp = parseFloat(inv.inverterTemperature || 0);
+  const insulation = parseFloat(inv.insulationResistance || 0);
+  const machine = inv.machine || "S6-EH1P10K-L-PLUS";
+  const stationName = station.stationName || "JJKWT’s Home";
+  const faultDesc = inv.faultCodeDesc || "Generating";
+
   const daySolarKwh = parseFloat(station.dayEnergy || inv.homeLoadTodayEnergy || 0);
+  const gridPurchasedToday = parseFloat(station.gridPurchasedTodayEnergy || inv.gridPurchasedTodayEnergy || 0);
+  const gridSellToday = parseFloat(station.gridSellTodayEnergy || inv.gridSellTodayEnergy || 0);
+  const homeLoadToday = parseFloat(station.homeLoadTodayEnergy || inv.homeLoadTodayEnergy || 0);
+
+  const homeLoadYest = parseFloat(inv.homeLoadYesterdayEnergy || 0);
+  const gridPurchasedYest = parseFloat(inv.gridPurchasedYesterdayEnergy || 0);
+
   const monthSolarKwh = parseFloat(station.monthEnergy || inv.homeLoadMonthEnergy || 0);
-  const batChargedToday = parseFloat(station.batteryTodayChargeEnergy || inv.batteryTodayChargeEnergy || 0);
-  const batDischargedToday = parseFloat(station.batteryTodayDischargeEnergy || inv.batteryTodayDischargeEnergy || 0);
+  const allEnergy = parseFloat(station.allEnergy || inv.eTotal || 0);
+  const gridPurchasedTotal = parseFloat(station.gridPurchasedTotalEnergy || inv.gridPurchasedTotalEnergy || 0);
+  const gridSellTotal = parseFloat(station.gridSellTotalEnergy || inv.gridSellTotalEnergy || 0);
+  const homeLoadTotal = parseFloat(station.homeLoadTotalEnergy || inv.homeLoadTotalEnergy || 0);
 
   const savingsToday = daySolarKwh * CONFIG.ELECTRICITY_RATE_THB;
   const savingsMonth = monthSolarKwh * CONFIG.ELECTRICITY_RATE_THB;
+  const savingsAll = allEnergy * CONFIG.ELECTRICITY_RATE_THB;
+
   const bar = getProgressBar(soc);
-  const evAdvice = getEvChargingAdvice(thTime.getHours(), soc, pvPower, loadPower);
 
   let batStatusHeader = "⏸ แบตเตอรี่สแตนด์บาย";
-  let batSubText = "• สถานะ: `สแตนด์บาย` (ไม่ได้ชาร์จหรือคายประจุ)";
+  let batSubDetail = "• สถานะ: `สแตนด์บาย` (พร้อมจ่ายไฟเมื่อจำเป็น)";
 
   if (soc >= 99.5) {
     batStatusHeader = "🔋 แบตเตอรี่เต็ม 100% พร้อมใช้งาน";
-    batSubText = "• กำลังชาร์จ: `0.00 kW` ✅ (แบตเต็มแล้ว พร้อมชาร์จรถ EV! 🚗⚡)";
+    batSubDetail = "• กำลังชาร์จ: `0.00 kW` ✅ (แบตเต็มแล้ว พร้อมชาร์จรถ EV! 🚗⚡)";
   } else if (batPower > 0.05 || batDir === 1) {
     batStatusHeader = "⚡ กำลังชาร์จไฟเข้าแบตเตอรี่";
     const powerKw = Math.abs(batPower) || 0.1;
     const kwhNeeded = Math.max(0, ((100 - soc) / 100) * CONFIG.BATTERY_CAPACITY_KWH);
     const totalMins = Math.round((kwhNeeded / powerKw) * 60);
+    const h = Math.floor(totalMins / 60);
+    const m = totalMins % 60;
     const estTime = new Date(thTime.getTime() + totalMins * 60000);
     const estStr = `${String(estTime.getHours()).padStart(2, "0")}:${String(estTime.getMinutes()).padStart(2, "0")} น.`;
-    batSubText = `• กำลังชาร์จเข้า: \`+${powerKw.toFixed(2)} kW\` ⚡\n• ⏳ **คาดว่าเต็ม 100% ในอีก:** \`${totalMins} นาที\` *(~${estStr})*`;
+    batSubDetail = `• กำลังชาร์จเข้า: \`+${powerKw.toFixed(2)} kW\` (${batCurr.toFixed(1)}A / ${batVolt.toFixed(1)}V)\n• ⏳ **คาดว่าจะเต็ม 100% ในอีก:** \`${h > 0 ? h + " ชม. " : ""}${m} นาที\` *(~${estStr})*`;
   } else if (batPower < -0.05 || batDir === 2) {
     batStatusHeader = "🌙 กำลังจ่ายไฟจากแบตเตอรี่";
     const powerKw = Math.abs(batPower);
@@ -239,39 +379,53 @@ function formatReport(station, inv) {
     const m = Math.round((hrs - h) * 60);
     const estTime = new Date(thTime.getTime() + (h * 60 + m) * 60000);
     const estStr = `${String(estTime.getHours()).padStart(2, "0")}:${String(estTime.getMinutes()).padStart(2, "0")} น.`;
-    batSubText = `• กำลังจ่ายไฟออก: \`-${powerKw.toFixed(2)} kW\` 🔻\n• ⏳ **ใช้งานต่อได้อีก:** \`${h} ชม. ${m} นาที\` *(คาดว่าแบตหมด ${estStr})*`;
+    batSubDetail = `• กำลังจ่ายไฟออก: \`-${powerKw.toFixed(2)} kW\` (${batCurr.toFixed(1)}A / ${batVolt.toFixed(1)}V)\n• ⏳ **ใช้งานต่อได้อีก:** \`${h} ชม. ${m} นาที\` *(คาดว่าแบตหมด ${estStr})*`;
   }
 
-  const gridPower = Math.max(0, loadPower - pvPower);
-  const gridText = `• 🔌 ไฟหลวง (Grid): \`${gridPower.toFixed(2)} kW\`` + (gridPower <= 0.05 ? " *(Self-Powered 100%)*" : "");
+  const gridSelfText = gridPower <= 0.05 ? " *(Self-Powered 100%)*" : "";
+  const evAdvice = getEvChargingAdvice(thTime.getHours(), soc, pvPower, loadPower);
 
-  return `☀️ **SOLIS ENERGY MONITOR**
+  return `☀️ **SOLIS HYBRID ENERGY DASHBOARD**
+📍 *สถานี: ${stationName} | รุ่น: ${machine}*
 ⏱ *อัปเดต: ${timeStr} | สภาพอากาศ: ${weatherStr}*
 ──────────────────
-🔋 **สถานะแบตเตอรี่ (Battery State)**
-• ระดับแบต: \`[${bar}] ${soc.toFixed(0)}%\` *(${currentKwh.toFixed(1)} / ${CONFIG.BATTERY_CAPACITY_KWH.toFixed(1)} kWh)*
-${batSubText}
-• สุขภาพแบตเตอรี่ (SOH): \`${soh.toFixed(0)}%\`
-• 🛡️ *ตั้งค่า Cut-off สำรองไฟไว้ที่: ${cutoffSoc.toFixed(0)}% (${cutoffKwh.toFixed(1)} kWh)*
+🟢 **สถานะการทำงาน:** \`${faultDesc}\` | Inverter Online ✅
+• 🏠 ไฟในบ้าน: ${gridPower <= 0.05 ? "Self-Powered 100% (ไม่เสียค่าไฟหลวง)" : `ดึงไฟหลวง ${gridPower.toFixed(2)} kW`}
+• 🌡️ ความร้อน Inverter: \`${invTemp.toFixed(1)}°C\` | ค่าฉนวน (Insulation): \`${insulation} kΩ\`
 
-⚡ **การไหลของพลังงาน (Power Flow)**
+🔋 **สถานะระบบแบตเตอรี่ (Battery Storage)**
+• ระดับแบตเตอรี่ (SOC): \`[${bar}] ${soc.toFixed(0)}%\` *(${currentKwh.toFixed(1)} / ${CONFIG.BATTERY_CAPACITY_KWH.toFixed(1)} kWh)*
+• สุขภาพแบตเตอรี่ (SOH): \`${soh.toFixed(0)}%\` *(สมบูรณ์)*
+${batSubDetail}
+• 🛡️ *ตั้งสำรองไฟ (Cut-off): ${cutoffSoc.toFixed(0)}% (${cutoffKwh.toFixed(1)} kWh)*
+• ⚙️ ลิมิตกระแส: ชาร์จสูงสุด \`${maxChargeI.toFixed(0)}A\` | จ่ายสูงสุด \`${maxDischargeI.toFixed(0)}A\`
+• 📊 วันนี้: ชาร์จเข้าแล้ว \`${batChargedToday.toFixed(1)} kWh\` | จ่ายออกแล้ว \`${batDischargedToday.toFixed(1)} kWh\`
+${batChargedYest > 0 || batDischargedYest > 0 ? `• 📆 เมื่อวาน: ชาร์จเข้า \`${batChargedYest.toFixed(1)} kWh\` | จ่ายออก \`${batDischargedYest.toFixed(1)} kWh\`\n` : ""}
+⚡ **การไหลของพลังงานสด (Real-time Power Flow)**
 • ☀️ แผงโซล่าเซลล์รวม: \`${pvPower.toFixed(2)} kW\`
   ├ 🧭 สตริง 1: \`${pow1.toFixed(0)} W\` *(${uPv1.toFixed(1)}V / ${iPv1.toFixed(1)}A)*
-  └ 🧭 สตริง 2: \`${pow2.toFixed(0)} W\` *(${uPv2.toFixed(1)}V / ${iPv2.toFixed(1)}A)*
-• 🏠 โหลดใช้ในบ้าน: \`${loadPower.toFixed(2)} kW\`
-${gridText}
-• 🌡️ ความร้อน Inverter: \`${invTemp.toFixed(1)}°C\` | ไฟหลวง: \`${gridVolt.toFixed(1)}V\`
+  ├ 🧭 สตริง 2: \`${pow2.toFixed(0)} W\` *(${uPv2.toFixed(1)}V / ${iPv2.toFixed(1)}A)*
+  └ 🔌 DC Bus: \`${dcBus.toFixed(1)} V\`
+• 🏠 โหลดใช้ไฟในบ้าน: \`${loadPower.toFixed(2)} kW\` *(${Math.round(loadPower * 1000)} W)*
+• 🔌 ไฟหลวง (Grid): \`${gridPower.toFixed(2)} kW\`${gridSelfText}
+  └ รายละเอียดไฟหลวง: \`${gridVolt.toFixed(1)}V\` | \`${gridCurr.toFixed(2)}A\` | \`${gridFreq.toFixed(2)}Hz\` | \`${gridReactive.toFixed(0)} Var\`
 
 🚗 **คำแนะนำชาร์จรถ EV:**
 • ${evAdvice}
 
-💰 **สรุปยอดวันนี้ (Today Summary)**
-• ไฟที่ผลิตได้วันนี้: \`${daySolarKwh.toFixed(2)} kWh\`
-• ชาร์จเข้าแบตแล้ว: \`${batChargedToday.toFixed(2)} kWh\` | ดึงมาใช้: \`${batDischargedToday.toFixed(2)} kWh\`
-• 💵 **เซฟเงินค่าไฟวันนี้: \`~${savingsToday.toFixed(2)} บาท\`** *(คิดที่ ${CONFIG.ELECTRICITY_RATE_THB} บ./หน่วย)*
-• 📈 เซฟเงินสะสมเดือนนี้: \`~${savingsMonth.toFixed(2)} บาท\`
+💰 **สถิติพลังงานและการประหยัดเงิน** *(คิดที่ ${CONFIG.ELECTRICITY_RATE_THB} บ./หน่วย)*
+• 📅 **วันนี้ (Today):**
+  ├ ☀️ ผลิตไฟได้: \`${daySolarKwh.toFixed(2)} kWh\` *(💵 ประหยัด ~${savingsToday.toFixed(2)} บาท)*
+  ├ 🔌 ดึงไฟหลวงมาใช้: \`${gridPurchasedToday.toFixed(2)} kWh\` | ขายไฟคืน: \`${gridSellToday.toFixed(2)} kWh\`
+  └ 🏠 บ้านใช้ไฟทั้งหมด: \`${homeLoadToday.toFixed(2)} kWh\`
+${homeLoadYest > 0 ? `• 📆 **เมื่อวาน (Yesterday):** บ้านใช้ไฟ \`${homeLoadYest.toFixed(2)} kWh\` | ซื้อไฟหลวง \`${gridPurchasedYest.toFixed(2)} kWh\`\n` : ""}• 📈 **เดือนนี้สะสม (Month-to-Date):**
+  └ ☀️ ผลิตได้: \`${monthSolarKwh.toFixed(2)} kWh\` *(💵 ประหยัด ~${savingsMonth.toFixed(2)} บาท)*
+• 🏆 **ตลอดอายุการใช้งาน (Lifetime):**
+  ├ ☀️ ผลิตไฟรวม: \`${allEnergy.toFixed(2)} kWh\` *(ประหยัดสะสม ~${savingsAll.toFixed(2)} บาท)*
+  ├ 🔌 ซื้อไฟหลวงสะสม: \`${gridPurchasedTotal.toFixed(2)} kWh\` | ขายไฟคืน: \`${gridSellTotal.toFixed(2)} kWh\`
+  └ 🏠 บ้านใช้ไฟสะสมรวม: \`${homeLoadTotal.toFixed(2)} kWh\`
 ──────────────────
-✅ *สถานะระบบ: ปกติ (Inverter Online)*`;
+Solis SN: \`${inv.sn || CONFIG.SOLIS_INVERTER_SN}\` | Batt SN: \`${inv.batterySn || "-"}\``;
 }
 
 function cleanForLine(text) {
@@ -332,7 +486,7 @@ async function handleLineEvent(event) {
     // เมื่อดึงบอทเข้ากลุ่ม
     if (event.type === "join") {
       const gid = event.source?.groupId || event.source?.roomId || "";
-      await sendLineReply(replyToken, `👋 สวัสดีครับ! ผม Solis Solar Bot ☀️\n\n🆔 Group ID:\n${gid}\n\n💡 พิมพ์ "ไฟ" หรือ "status" ในกลุ่มเพื่อดูข้อมูลโซล่าเซลล์ได้ตลอดเวลาครับ`);
+      await sendLineReply(replyToken, `👋 สวัสดีครับ! ผม Solis Solar Bot ☀️\n\n🆔 Group ID:\n${gid}\n\n💡 พิมพ์ "ไฟ" หรือ "สถานะ" ในกลุ่มเพื่อดูข้อมูลโซล่าเซลล์ได้ตลอดเวลาครับ`);
       return;
     }
 
@@ -348,32 +502,31 @@ async function handleLineEvent(event) {
         return;
       }
 
-      const isQuery = ["status", "solar", "ไฟ", "แบต", "สรุป", "ค่าไฟ", "พลังงาน", "ev", "ดูไฟ", "เช็คไฟ", "สถานะ", "โซล่า"].some(k => text.includes(k));
-      if (isQuery) {
-        const msg = await getSolarReport();
+      // ตรวจจับเฉพาะคำสั่งเดี่ยวๆ (Exact Match)
+      if (VALID_COMMANDS.has(text)) {
+        const { stationData, invData } = await getSolarData();
+        const msg = formatLineReport(stationData, invData);
         const replied = await sendLineReply(replyToken, msg);
-        // หาก Reply Token หมดอายุหรือไม่สำเร็จ ให้ fallback ส่ง push ไปที่ห้องนั้น
+        // หาก Reply Token หมดอายุหรือไม่สำเร็จ ให้ fallback ส่ง push
         if (!replied && targetId) {
           await sendLinePush(targetId, msg);
         }
-      } else if (!isGroup) {
-        // ตอบแนะนำเฉพาะในแชทส่วนตัว ไม่ตอบรบกวนเวลาคนคุยกันในกลุ่ม
-        await sendLineReply(replyToken, "💡 พิมพ์ 'status' หรือ 'ไฟ' เพื่อดูข้อมูลโซล่าเซลล์และแบตเตอรี่ได้ตลอดเวลาครับ");
       }
+      // ถ้าไม่ใช่คำสั่งเดี่ยวๆ ไม่ตอบอะไรทั้งสิ้น เพื่อไม่ให้กวนเวลาคุยกัน
     }
   } catch (err) {
     console.error("handleLineEvent error:", err);
   }
 }
 
-async function getSolarReport() {
+async function getSolarData() {
   const [stationRes, invRes] = await Promise.all([
     callSolisApi("/v1/api/userStationList", { pageNo: 1, pageSize: 10 }),
     callSolisApi("/v1/api/inverterDetail", { sn: CONFIG.SOLIS_INVERTER_SN })
   ]);
   const stationData = stationRes?.data?.page?.records?.[0] || stationRes?.data?.[0] || {};
   const invData = invRes?.data || {};
-  return formatReport(stationData, invData);
+  return { stationData, invData };
 }
 
 export default {
@@ -384,30 +537,32 @@ export default {
       const thTime = new Date(now.getTime() + (7 * 60 + now.getTimezoneOffset()) * 60000);
       const thHour = thTime.getHours();
 
-      const msg = await getSolarReport();
+      const { stationData, invData } = await getSolarData();
+      const telegramMsg = formatTelegramReport(stationData, invData);
+      const lineMsg = formatLineReport(stationData, invData);
 
-      // Telegram: ส่งทุกชั่วโมง 08:00 - 21:00 น. (ฟรีไม่จำกัด)
-      ctx.waitUntil(sendTelegram(CONFIG.TELEGRAM_CHAT_ID, msg));
+      // Telegram: ส่งทุกชั่วโมง 08:00 - 21:00 น. (รายงานละเอียดครบทุกอย่าง)
+      ctx.waitUntil(sendTelegram(CONFIG.TELEGRAM_CHAT_ID, telegramMsg));
 
-      // LINE: ส่งเฉพาะ 08:00, 13:00, 18:00 น. เพื่อคุมโควตาฟรี 500 ข้อความ/เดือน (3 ครั้ง x 5 คน x 30 วัน = 450 ข้อความ)
+      // LINE: ส่งเฉพาะ 08:00, 13:00, 18:00 น. (รายงานสั้น เข้าใจง่าย)
       const isLineHour = [8, 13, 18].includes(thHour);
       const lineTarget = CONFIG.LINE_GROUP_ID || CONFIG.LINE_USER_ID;
       if (isLineHour && lineTarget && !lineTarget.includes("ใส่_")) {
-        ctx.waitUntil(sendLinePush(lineTarget, msg));
+        ctx.waitUntil(sendLinePush(lineTarget, lineMsg));
       }
     } catch (e) {
       console.error("Scheduled report error:", e);
     }
   },
 
-  // 2. ถาม-ตอบทันทีเมื่อแชท (รองรับทั้ง Telegram & LINE)
+  // 2. ถาม-ตอบทันทีเมื่อแชท (รองรับทั้ง Telegram & LINE แบบ Exact Match)
   async fetch(request, env, ctx) {
     if (request.method !== "POST") return new Response("Solis Bot (Telegram + LINE) is Running 24/7!", { status: 200 });
     
     try {
       const body = await request.json();
 
-      // LINE Webhook (ตอบกลับ 200 OK ทันที แล้วประมวลผลผ่าน waitUntil เพื่อป้องกัน LINE Webhook Timeout)
+      // LINE Webhook
       if (body.events && Array.isArray(body.events)) {
         for (const event of body.events) {
           ctx.waitUntil(handleLineEvent(event));
@@ -419,16 +574,17 @@ export default {
       if (body.message && body.message.text) {
         const chatId = body.message.chat.id;
         const text = body.message.text.trim().toLowerCase();
-        const isQuery = ["/status", "/solar", "/soral", "/battery", "/start", "status", "solar", "ไฟ", "แบต", "สรุป", "ค่าไฟ", "พลังงาน", "ev", "ดูไฟ", "เช็คไฟ", "สถานะ", "โซล่า"].some(k => text.includes(k));
-        if (isQuery) {
+
+        // ตรวจจับเฉพาะคำสั่งเดี่ยวๆ (Exact Match)
+        if (VALID_COMMANDS.has(text)) {
           ctx.waitUntil((async () => {
             await sendTelegram(chatId, "⏳ กำลังดึงข้อมูลสดจาก Solis Inverter สักครู่นะครับ...");
-            const msg = await getSolarReport();
+            const { stationData, invData } = await getSolarData();
+            const msg = formatTelegramReport(stationData, invData);
             await sendTelegram(chatId, msg);
           })());
-        } else {
-          ctx.waitUntil(sendTelegram(chatId, "💡 พิมพ์ `/status` หรือ `/solar` เพื่อดูข้อมูลได้ตลอดเวลาครับ"));
         }
+        // ถ้าไม่ใช่คำสั่งเดี่ยวๆ ไม่ตอบอะไรทั้งสิ้น ป้องกันการเด้งเวลาคุยเรื่องอื่น
         return new Response("OK", { status: 200 });
       }
     } catch (e) {
