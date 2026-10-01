@@ -10,6 +10,8 @@ const CONFIG = {
   BATTERY_CAPACITY_KWH: 16.0,
   ELECTRICITY_RATE_THB: 4.50,
   BILLING_CUTOFF_DAY: 19,
+  HOME_LAT: 14.0350,
+  HOME_LON: 100.7407,
 
   // Telegram Credentials
   TELEGRAM_BOT_TOKEN: "8945013570:AAFwdZegsgY-A2bxXEV7KNu3lapxQfrN2ok",
@@ -239,6 +241,44 @@ function getMoneySummary(station, inv, cycleData, thTime) {
   };
 }
 
+// แปลง WMO weather code จาก Open-Meteo เป็นข้อความไทย + ตัวคูณแดด
+function describeWmo(code, isDay) {
+  if (code === 0) return isDay ? { text: "แดดจัด แจ่มใส ☀️", factor: 1.0 } : { text: "ท้องฟ้าแจ่มใส 🌙", factor: 1.0 };
+  if (code === 1) return { text: isDay ? "แดดดี มีเมฆเล็กน้อย 🌤️" : "มีเมฆเล็กน้อย 🌙", factor: 0.95 };
+  if (code === 2) return { text: "มีเมฆบางส่วน ⛅", factor: 0.8 };
+  if (code === 3) return { text: "มีเมฆมาก ☁️", factor: 0.65 };
+  if (code === 45 || code === 48) return { text: "มีหมอก 🌫️", factor: 0.6 };
+  if (code >= 51 && code <= 57) return { text: "ฝนปรอยๆ 🌦️", factor: 0.45 };
+  if ((code >= 61 && code <= 67) || (code >= 80 && code <= 82)) return { text: "มีฝนตก 🌧️", factor: 0.4 };
+  if (code >= 95) return { text: "ฝนฟ้าคะนอง ⛈️", factor: 0.3 };
+  return null;
+}
+
+// สภาพอากาศตอนนี้จาก Open-Meteo ตามพิกัดบ้าน คืน null ถ้า API ล่ม
+async function getCurrentWeather() {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 10000);
+  try {
+    const url = `https://api.open-meteo.com/v1/forecast?latitude=${CONFIG.HOME_LAT}&longitude=${CONFIG.HOME_LON}&current=weather_code,cloud_cover,is_day&timezone=Asia%2FBangkok`;
+    const res = await fetch(url, { signal: controller.signal });
+    if (!res.ok) return null;
+    const cur = (await res.json())?.current;
+    const desc = cur ? describeWmo(cur.weather_code, cur.is_day === 1) : null;
+    return desc ? { ...desc, cloudCover: cur.cloud_cover } : null;
+  } catch (err) {
+    console.error("getCurrentWeather error:", err);
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// ใช้ Open-Meteo ก่อน ถ้าไม่ได้ค่อยใช้พยากรณ์รายวันของ Solis (condTxtD อัปเดตวันละครั้ง)
+function resolveWeather(current, station) {
+  if (current) return current;
+  return { text: translateWeather(station.condTxtD), factor: getWeatherFactor(station.condTxtD), cloudCover: null };
+}
+
 function translateWeather(cond) {
   if (!cond) return "ไม่ระบุ ⛅";
   const c = cond.toLowerCase();
@@ -270,7 +310,7 @@ function getWeatherFactor(cond) {
 }
 
 // คำนวณแดดเหลือทิ้งที่แท้จริง (Dynamic Solar Curtailment Model)
-function calculateSolarCurtailment(thHour, thMinute, weatherCond, peakPowerKw, pvPower, loadPower, soc) {
+function calculateSolarCurtailment(thHour, thMinute, weatherFactor, peakPowerKw, pvPower, loadPower, soc) {
   const t = thHour + thMinute / 60.0;
   // หลัง 16:30 แดดจะเริ่มอ่อนมาก ไม่ถือว่ามีแดดเหลือทิ้งที่มีนัยสำคัญ
   if (t < 9.0 || t > 16.5) {
@@ -284,7 +324,6 @@ function calculateSolarCurtailment(thHour, thMinute, weatherCond, peakPowerKw, p
   }
 
   const timeFactor = getSolarTimeFactor(thHour, thMinute);
-  const weatherFactor = getWeatherFactor(weatherCond);
   const baseNoonPeak = Math.max(peakPowerKw || 0, 8.5);
 
   const potentialKw = Math.max(pvPower, baseNoonPeak * timeFactor * weatherFactor);
@@ -312,7 +351,7 @@ function getActiveAlarms(alarmData) {
 }
 
 // สถานะสดที่ LINE กับ Telegram ใช้ร่วมกัน
-function getLiveStatus(station, inv, dayData, thTime) {
+function getLiveStatus(station, inv, dayData, thTime, weather) {
   const thHour = thTime.getHours();
   const soc = parseFloat(inv.batteryCapacitySoc || inv.batteryPercent || 100);
   const cutoffSoc = parseFloat(inv.socDischargeSet || 10);
@@ -333,7 +372,7 @@ function getLiveStatus(station, inv, dayData, thTime) {
       }
     }
   }
-  const curtailment = calculateSolarCurtailment(thHour, thTime.getMinutes(), station.condTxtD, peakW / 1000.0, pvPower, loadPower, soc);
+  const curtailment = calculateSolarCurtailment(thHour, thTime.getMinutes(), weather.factor, peakW / 1000.0, pvPower, loadPower, soc);
   const wasted = curtailment.isCurtailing ? curtailment.wastedKw : 0;
 
   // สถานะหลัก: รู้ทันทีว่าเสียเงินไหม
@@ -390,13 +429,13 @@ function getLiveStatus(station, inv, dayData, thTime) {
 }
 
 // 1. ฟอร์แมตสำหรับ LINE (สั้น กระชับ ภาษาชาวบ้าน ผู้ใหญ่อ่าน 3 วินาทีเข้าใจ)
-function formatLineReport(station, inv, dayData, cycleData) {
+function formatLineReport(station, inv, dayData, cycleData, weather) {
   const now = new Date();
   const thTime = new Date(now.getTime() + (7 * 60 + now.getTimezoneOffset()) * 60000);
-  const s = getLiveStatus(station, inv, dayData, thTime);
+  const s = getLiveStatus(station, inv, dayData, thTime, weather);
   const money = getMoneySummary(station, inv, cycleData, thTime);
 
-  return `☀️ ไฟบ้าน ${formatClock(thTime)} · ${translateWeather(station.condTxtD)}
+  return `☀️ ไฟบ้าน ${formatClock(thTime)} · ${weather.text}
 
 ${s.statusTitle}
    ${s.statusDetail}
@@ -415,10 +454,10 @@ ${s.statusTitle}
 }
 
 // 2. Telegram: ข้อความเดียว ละเอียดกว่า LINE แต่โชว์ของที่ผิดปกติเท่านั้นในส่วนอุปกรณ์
-function formatTelegramReport(station, inv, dayData, cycleData, colData, alarmData) {
+function formatTelegramReport(station, inv, dayData, cycleData, colData, alarmData, weather) {
   const now = new Date();
   const thTime = new Date(now.getTime() + (7 * 60 + now.getTimezoneOffset()) * 60000);
-  const s = getLiveStatus(station, inv, dayData, thTime);
+  const s = getLiveStatus(station, inv, dayData, thTime, weather);
   const money = getMoneySummary(station, inv, cycleData, thTime);
   const num = (v) => parseFloat(v || 0);
 
@@ -458,7 +497,9 @@ function formatTelegramReport(station, inv, dayData, cycleData, colData, alarmDa
   const wifiText = rssi !== undefined && rssi !== null ? ` · Wi-Fi ${rssi} dBm${rssi < -75 ? " ⚠️" : ""}` : "";
   const deviceLine = `Inverter ${num(inv.inverterTemperature).toFixed(1)}°C${wifiText} · ฉนวน ${num(inv.insulationResistance)} kΩ`;
 
-  return `☀️ *Solis · ${formatClock(thTime)}* · ${translateWeather(station.condTxtD)}
+  const cloudText = weather.cloudCover !== null && weather.cloudCover !== undefined ? ` (เมฆ ${weather.cloudCover}%)` : "";
+
+  return `☀️ *Solis · ${formatClock(thTime)}* · ${weather.text}${cloudText}
 ${statusLine}
 
 ⚡ *ตอนนี้*
@@ -468,7 +509,6 @@ ${statusLine}
 ☀️ *แผง*
 S1 \`${pow1.toFixed(0)} W\` ${uPv1.toFixed(1)}V / ${iPv1.toFixed(1)}A
 S2 \`${pow2.toFixed(0)} W\` ${uPv2.toFixed(1)}V / ${iPv2.toFixed(1)}A
-DC Bus ${num(inv.dcBus).toFixed(1)}V
 
 🔋 *แบต* \`${s.soc.toFixed(0)}%\` ${getProgressBar(s.soc)} (${currentKwh.toFixed(1)}/${CONFIG.BATTERY_CAPACITY_KWH.toFixed(0)} kWh)
 SOH ${soh.toFixed(0)}% · ${batVolt.toFixed(1)}V / ${batCurr.toFixed(1)}A
@@ -582,8 +622,8 @@ async function handleLineEvent(event) {
 
       // ตรวจจับเฉพาะคำสั่งเดี่ยวๆ (Exact Match)
       if (VALID_COMMANDS.has(text) || VALID_COMMANDS.has(rawText)) {
-        const { stationData, invData, dayData, cycleData } = await getSolarData();
-        const msg = formatLineReport(stationData, invData, dayData, cycleData);
+        const { stationData, invData, dayData, cycleData, weather } = await getSolarData();
+        const msg = formatLineReport(stationData, invData, dayData, cycleData, weather);
         const replied = await sendLineReply(replyToken, msg);
         // หาก Reply Token หมดอายุหรือไม่สำเร็จ ให้ fallback ส่ง push
         if (!replied && targetId) {
@@ -602,13 +642,14 @@ async function getSolarData() {
   const thTime = new Date(now.getTime() + (7 * 60 + now.getTimezoneOffset()) * 60000);
   const todayStr = thTime.toISOString().slice(0, 10);
 
-  const [stationRes, invRes, dayRes, colRes, alarmRes, cycleData] = await Promise.all([
+  const [stationRes, invRes, dayRes, colRes, alarmRes, cycleData, currentWeather] = await Promise.all([
     callSolisApi("/v1/api/userStationList", { pageNo: 1, pageSize: 10 }),
     callSolisApi("/v1/api/inverterDetail", { sn: CONFIG.SOLIS_INVERTER_SN }),
     callSolisApi("/v1/api/stationDay", { money: "THB", time: todayStr, timeZone: 7, id: CONFIG.SOLIS_STATION_ID }),
     callSolisApi("/v1/api/collectorDetail", { sn: CONFIG.SOLIS_COLLECTOR_SN }),
     callSolisApi("/v1/api/alarmList", { begintime: todayStr, endtime: todayStr, deviceSn: CONFIG.SOLIS_INVERTER_SN, pageNo: 1, pageSize: 10 }),
-    getCycleData(thTime)
+    getCycleData(thTime),
+    getCurrentWeather()
   ]);
 
   const stationData = stationRes?.data?.page?.records?.[0] || stationRes?.data?.[0] || {};
@@ -617,7 +658,9 @@ async function getSolarData() {
   const colData = colRes?.data || {};
   const alarmData = alarmRes?.data || {};
 
-  return { stationData, invData, dayData, colData, alarmData, cycleData };
+  const weather = resolveWeather(currentWeather, stationData);
+
+  return { stationData, invData, dayData, colData, alarmData, cycleData, weather };
 }
 
 export default {
@@ -628,9 +671,9 @@ export default {
       const thTime = new Date(now.getTime() + (7 * 60 + now.getTimezoneOffset()) * 60000);
       const thHour = thTime.getHours();
 
-      const { stationData, invData, dayData, colData, alarmData, cycleData } = await getSolarData();
-      const telegramMsg = formatTelegramReport(stationData, invData, dayData, cycleData, colData, alarmData);
-      const lineMsg = formatLineReport(stationData, invData, dayData, cycleData);
+      const { stationData, invData, dayData, colData, alarmData, cycleData, weather } = await getSolarData();
+      const telegramMsg = formatTelegramReport(stationData, invData, dayData, cycleData, colData, alarmData, weather);
+      const lineMsg = formatLineReport(stationData, invData, dayData, cycleData, weather);
 
       // ตรวจสอบ Alarm ฉุกเฉิน ถ้ามี ส่งเตือนทันที
       const activeAlarms = getActiveAlarms(alarmData);
@@ -686,8 +729,8 @@ export default {
         if (VALID_COMMANDS.has(text) || VALID_COMMANDS.has(rawText.toLowerCase())) {
           ctx.waitUntil((async () => {
             await sendChatAction(chatId, "typing");
-            const { stationData, invData, dayData, colData, alarmData, cycleData } = await getSolarData();
-            await sendTelegram(chatId, formatTelegramReport(stationData, invData, dayData, cycleData, colData, alarmData));
+            const { stationData, invData, dayData, colData, alarmData, cycleData, weather } = await getSolarData();
+            await sendTelegram(chatId, formatTelegramReport(stationData, invData, dayData, cycleData, colData, alarmData, weather));
           })());
         }
         // ถ้าไม่ใช่คำสั่งเดี่ยวๆ ไม่ตอบอะไรทั้งสิ้น ป้องกันการเด้งเวลาคุยเรื่องอื่น
