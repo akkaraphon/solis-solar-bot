@@ -102,7 +102,10 @@ def format_telegram_message(station, inv):
     cutoff_kwh = (cutoff_soc / 100.0) * BATTERY_CAPACITY_KWH
     
     bat_power = float(inv.get("batteryPower", inv.get("batteryPowerBms", 0.0)))
-    bat_dir = inv.get("batteryDirection", 0)
+    bat_dir = int(inv.get("batteryDirection", 0) or 0)
+    # เช็คทิศจาก batteryDirection ก่อน (1=ชาร์จ, 2=จ่ายออก) เพราะ batteryPower อาจไม่มีเครื่องหมาย
+    is_discharging = bat_dir == 2 or (bat_dir != 1 and bat_power < -0.05)
+    is_charging = not is_discharging and (bat_dir == 1 or bat_power > 0.05)
     
     # Real-time Powers
     pv_power = float(inv.get("pac", 0.0))
@@ -138,9 +141,9 @@ def format_telegram_message(station, inv):
     if soc >= 99.5:
         bat_status_header = "🔋 แบตเตอรี่เต็ม 100% พร้อมใช้งาน"
         bat_sub_text = "• กำลังชาร์จ: `0.00 kW` ✅ (แบตเต็มแล้ว พร้อมชาร์จรถ EV! 🚗⚡)"
-    elif bat_power > 0.05 or bat_dir == 1:
+    elif is_charging:
         bat_status_header = "⚡ กำลังชาร์จไฟเข้าแบตเตอรี่"
-        power_kw = abs(bat_power) if bat_power > 0 else 0.1
+        power_kw = abs(bat_power) or 0.1
         kwh_needed = max(0.0, ((100.0 - soc) / 100.0) * BATTERY_CAPACITY_KWH)
         hrs = kwh_needed / power_kw if power_kw > 0.05 else 0
         minutes = int(hrs * 60)
@@ -149,7 +152,7 @@ def format_telegram_message(station, inv):
             f"• กำลังชาร์จเข้า: `+{power_kw:.2f} kW` ⚡\n"
             f"• ⏳ **คาดว่าเต็ม 100% ในอีก:** `{minutes} นาที` *(~{target_time})*"
         )
-    elif bat_power < -0.05 or bat_dir == 2:
+    elif is_discharging:
         bat_status_header = "🌙 กำลังจ่ายไฟจากแบตเตอรี่"
         power_kw = abs(bat_power)
         usable_kwh = max(0.0, ((soc - cutoff_soc) / 100.0) * BATTERY_CAPACITY_KWH)
@@ -165,7 +168,12 @@ def format_telegram_message(station, inv):
         bat_status_header = "⏸ แบตเตอรี่สแตนด์บาย"
         bat_sub_text = "• สถานะ: `สแตนด์บาย` (ไม่ได้ชาร์จหรือคายประจุ)"
 
-    grid_power = max(0.0, load_power - pv_power)
+    # psum ติดลบ = ซื้อไฟหลวง, ถ้าไม่มี psum ให้หักไฟที่แบตจ่ายออกด้วย
+    psum = inv.get("psum")
+    if psum is not None and psum != "":
+        grid_power = max(0.0, -float(psum))
+    else:
+        grid_power = max(0.0, load_power - pv_power - (abs(bat_power) if is_discharging else 0.0))
     grid_text = f"• 🔌 ไฟหลวง (Grid): `{grid_power:.2f} kW`" + (" *(Self-Powered 100%)*" if grid_power <= 0.05 else "")
     
     # Message Construction
