@@ -152,6 +152,25 @@ function formatClock(date) {
   return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")} น.`;
 }
 
+const TH_WEEKDAYS = ["อา.", "จ.", "อ.", "พ.", "พฤ.", "ศ.", "ส."];
+
+// เวลาคาดการณ์ ถ้าข้ามวันให้บอกวันด้วย
+function formatEta(fromTime, estTime) {
+  const dayDiff = Math.round((Date.UTC(estTime.getFullYear(), estTime.getMonth(), estTime.getDate()) - Date.UTC(fromTime.getFullYear(), fromTime.getMonth(), fromTime.getDate())) / 86400000);
+  if (dayDiff === 0) return formatClock(estTime);
+  if (dayDiff === 1) return `พรุ่งนี้ ${formatClock(estTime)}`;
+  return `${TH_WEEKDAYS[estTime.getDay()]} ${estTime.getDate()} ${TH_MONTHS[estTime.getMonth()]} ${formatClock(estTime)}`;
+}
+
+function formatDuration(totalMins) {
+  const d = Math.floor(totalMins / 1440);
+  const h = Math.floor((totalMins % 1440) / 60);
+  const m = totalMins % 60;
+  if (d > 0) return `${d} วัน${h > 0 ? ` ${h} ชม.` : ""}`;
+  if (h > 0) return `${h} ชม.${m > 0 ? ` ${m} นาที` : ""}`;
+  return `${m} นาที`;
+}
+
 function formatBaht(value) {
   return Math.round(value).toLocaleString("en-US");
 }
@@ -398,14 +417,12 @@ function getLiveStatus(station, inv, dayData, thTime, weather) {
   } else if (bat.isCharging) {
     const kwhNeeded = ((100 - soc) / 100) * CONFIG.BATTERY_CAPACITY_KWH;
     const estTime = new Date(thTime.getTime() + Math.round((kwhNeeded / bat.powerKw) * 60) * 60000);
-    batLine = `กำลังชาร์จ · เต็มราว ${formatClock(estTime)}`;
+    batLine = `กำลังชาร์จ · เต็มราว ${formatEta(thTime, estTime)}`;
   } else if (bat.isDischarging) {
     const usableKwh = Math.max(0, ((soc - cutoffSoc) / 100) * CONFIG.BATTERY_CAPACITY_KWH);
     const totalMins = Math.round((usableKwh / bat.powerKw) * 60);
-    const h = Math.floor(totalMins / 60);
-    const m = totalMins % 60;
     const estTime = new Date(thTime.getTime() + totalMins * 60000);
-    batLine = `กำลังจ่ายไฟ · ใช้ได้อีก ~${h > 0 ? `${h} ชม. ` : ""}${m} นาที (ถึงราว ${formatClock(estTime)})`;
+    batLine = `กำลังจ่ายไฟ · ใช้ได้อีก ~${formatDuration(totalMins)} (ถึงราว ${formatEta(thTime, estTime)})`;
   } else {
     batLine = "พร้อมใช้ (สแตนด์บาย)";
   }
