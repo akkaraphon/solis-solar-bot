@@ -426,12 +426,6 @@ function formatTelegramReport(station, inv, dayData, cycleData, colData, alarmDa
   const pow1 = num(inv.pow1 || inv.mpptPow1), uPv1 = num(inv.uPv1 || inv.mpptUpv1), iPv1 = num(inv.iPv1 || inv.mpptIpv1);
   const pow2 = num(inv.pow2 || inv.mpptPow2), uPv2 = num(inv.uPv2 || inv.mpptUpv2), iPv2 = num(inv.iPv2 || inv.mpptIpv2);
 
-  // ไฟหลวง: ติด ⚠️ ถ้าแรงดัน/ความถี่หลุดช่วงปกติ
-  const gridVolt = num(inv.uAc1);
-  const gridCurr = num(inv.iAc1 || inv.gridDetailVo?.gridCurrentA);
-  const gridFreq = num(inv.fac || inv.gridDetailVo?.gridFac);
-  const gridWarn = gridVolt < 200 || gridVolt > 250 || gridFreq < 49.5 || gridFreq > 50.5 ? " ⚠️" : "";
-
   // แบต
   const batSign = s.bat.isCharging ? "+" : s.bat.isDischarging ? "-" : "";
   const batPowerText = s.bat.isCharging || s.bat.isDischarging ? `\`${batSign}${s.bat.powerKw.toFixed(1)} kW\` ` : "";
@@ -475,8 +469,6 @@ ${statusLine}
 S1 \`${pow1.toFixed(0)} W\` ${uPv1.toFixed(1)}V / ${iPv1.toFixed(1)}A
 S2 \`${pow2.toFixed(0)} W\` ${uPv2.toFixed(1)}V / ${iPv2.toFixed(1)}A
 DC Bus ${num(inv.dcBus).toFixed(1)}V
-
-🔌 *ไฟหลวง* ${gridVolt.toFixed(1)}V · ${gridCurr.toFixed(2)}A · ${gridFreq.toFixed(2)}Hz${gridWarn}
 
 🔋 *แบต* \`${s.soc.toFixed(0)}%\` ${getProgressBar(s.soc)} (${currentKwh.toFixed(1)}/${CONFIG.BATTERY_CAPACITY_KWH.toFixed(0)} kWh)
 SOH ${soh.toFixed(0)}% · ${batVolt.toFixed(1)}V / ${batCurr.toFixed(1)}A
